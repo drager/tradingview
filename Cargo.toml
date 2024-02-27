@@ -1,0 +1,27 @@
+[package]
+name = "tradingview"
+description = "Rust bindings for leveraging TradingView functionalities"
+version = "0.1.0"
+edition = "2021"
+authors = ["Jesper Håkansson <jesper@jesperh.se>"]
+repository = "https://github.com/drager/tradingview.git"
+license = "Apache-2.0"
+
+[dependencies]
+reqwest = { version = "0.11.4", features = ["json", "multipart", "cookies"] }
+anyhow = "1.0.42"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = [ "full" ] }
+tokio-tungstenite = { version = "0.21.0", features = ["native-tls"] }
+chrono = { version = "0.4.19", features = ["serde"] }
+futures = "0.3.16"
+typed-builder = "0.18.0"
+thiserror = "1.0.25"
+regex = "1.8.3"
+either = { version = "1.8.1", features = ["serde"]}
+log = "0.4.18"
+rand = "0.8.5"
+
+[dev-dependencies]
+httpmock = "0.6"

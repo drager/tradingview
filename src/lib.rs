@@ -335,6 +335,7 @@ impl TradingView {
         username: &str,
         password: &str,
         remember: bool,
+        on_two_factor: Option<fn() -> String>,
     ) -> anyhow::Result<User> {
         let server_url = self
             .client_options
@@ -400,7 +401,9 @@ impl TradingView {
 
                         self.user.lock().await.replace(user.clone());
 
-                        return self.two_factor("").await;
+                        let code = on_two_factor.expect("2FA code required")();
+
+                        return self.two_factor(&code, &user).await;
                     }
                     return Err(TradingViewError::InvalidCredentials.into());
                 }
@@ -429,7 +432,7 @@ impl TradingView {
         Ok(user)
     }
 
-    pub async fn two_factor(&self, code: &str) -> anyhow::Result<User> {
+    pub async fn two_factor(&self, code: &str, user: &User) -> anyhow::Result<User> {
         let server_url = self
             .client_options
             .server
@@ -437,9 +440,6 @@ impl TradingView {
             .unwrap_or(Self::SERVER_URL);
 
         let form = multipart::Form::new().text("code", code.to_string());
-        let user = self.user.lock().await;
-
-        let user = user.as_ref().ok_or(TradingViewError::InvalidCredentials)?;
 
         let session = user
             .get_session()

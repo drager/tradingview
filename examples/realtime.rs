@@ -1,5 +1,15 @@
+use std::io;
+
 use futures::StreamExt;
 use tradingview::{ClientOptions, Currency, TickerSymbol, TradingView};
+
+fn on_two_factor() -> String {
+    println!("Enter two factor code: ");
+
+    let mut code = String::new();
+    io::stdin().read_line(&mut code).unwrap();
+    code.trim().to_string()
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -8,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
     let trading_view = TradingView::new(client_options);
 
     trading_view
-        .login("username", "password", true)
+        .login("username", "password", true, Some(on_two_factor))
         .await
         .unwrap();
 

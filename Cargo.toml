@@ -1,7 +1,7 @@
 [package]
 name = "tradingview"
 description = "Rust bindings for leveraging TradingView functionalities"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Jesper Håkansson <jesper@jesperh.se>"]
 repository = "https://github.com/drager/tradingview.git"

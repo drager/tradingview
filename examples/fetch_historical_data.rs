@@ -18,7 +18,12 @@ async fn main() -> anyhow::Result<()> {
     let trading_view = TradingView::new(client_options);
 
     trading_view
-        .login("username", "password", true, Some(on_two_factor))
+        .login(
+            "username",
+            "password",
+            true,
+            Some(tradingview::Either::Right(on_two_factor)),
+        )
         .await?;
 
     let ticker = env::args().nth(1).expect("No ticker provided");

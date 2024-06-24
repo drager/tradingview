@@ -4,6 +4,7 @@ use futures::stream;
 use futures::Stream;
 use futures::StreamExt;
 
+use libreauth::oath::TOTPBuilder;
 use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
 use reqwest::multipart;
@@ -21,6 +22,8 @@ use typed_builder::TypedBuilder;
 use websocket::WebSocketClient;
 
 mod websocket;
+
+pub use either::Either;
 
 #[derive(Debug, Serialize, Deserialize, TypedBuilder)]
 pub struct TickerSymbol {
@@ -261,6 +264,12 @@ pub enum TradingViewError {
     #[error("Invalid username or password.")]
     InvalidCredentials,
 
+    #[error("Invalid two factor code.")]
+    InvalidTwoFactorCode,
+
+    #[error("Too many requests for two factor code.")]
+    TwoFactorCodeTooManyRequests,
+
     #[error("Internal server error.")]
     InternalServerError,
 
@@ -307,6 +316,9 @@ impl TradingViewLastPrice {
     }
 }
 
+pub struct TotpSecret(pub String);
+pub struct TwoFactorCode(String);
+
 pub struct TradingView {
     client_options: ClientOptions,
     user: Arc<Mutex<Option<User>>>,
@@ -335,7 +347,7 @@ impl TradingView {
         username: &str,
         password: &str,
         remember: bool,
-        on_two_factor: Option<fn() -> String>,
+        two_factor: Option<Either<TotpSecret, fn() -> String>>,
     ) -> anyhow::Result<User> {
         let server_url = self
             .client_options
@@ -401,7 +413,13 @@ impl TradingView {
 
                         self.user.lock().await.replace(user.clone());
 
-                        let code = on_two_factor.expect("2FA code required")();
+                        let code = match two_factor.expect("Two factor code required") {
+                            Either::Left(secret) => Either::Left(secret),
+                            Either::Right(on_two_factor) => {
+                                let code = on_two_factor();
+                                Either::Right(TwoFactorCode(code.to_string()))
+                            }
+                        };
 
                         return self.two_factor(&code, &user).await;
                     }
@@ -432,14 +450,27 @@ impl TradingView {
         Ok(user)
     }
 
-    pub async fn two_factor(&self, code: &str, user: &User) -> anyhow::Result<User> {
+    pub async fn two_factor(
+        &self,
+        code: &Either<TotpSecret, TwoFactorCode>,
+        user: &User,
+    ) -> anyhow::Result<User> {
         let server_url = self
             .client_options
             .server
             .as_deref()
             .unwrap_or(Self::SERVER_URL);
 
-        let form = multipart::Form::new().text("code", code.to_string());
+        let totp_code = match code {
+            Either::Left(TotpSecret(secret)) => TOTPBuilder::new()
+                .base32_key(secret)
+                .finalize()?
+                .generate()
+                .to_string(),
+            Either::Right(TwoFactorCode(code)) => code.to_string(),
+        };
+
+        let form = multipart::Form::new().text("code", totp_code.to_string());
 
         let session = user
             .get_session()
@@ -451,7 +482,7 @@ impl TradingView {
 
         let session_cookie = format!("sessionid={};sessionid_sign={};", session, signature);
 
-        let cookies = vec![HeaderValue::from_str(&session_cookie)?];
+        let cookies = [HeaderValue::from_str(&session_cookie)?];
 
         let mut headers = HeaderMap::new();
         headers.insert("Cookie", cookies[0].clone());
@@ -498,6 +529,18 @@ impl TradingView {
                 let user_response: Value = res.json().await?;
 
                 if let Some(_error) = user_response.get("error") {
+                    if user_response.get("error").and_then(|code| code.as_str())
+                        == Some("Invalid_code")
+                    {
+                        return Err(TradingViewError::InvalidTwoFactorCode.into());
+                    }
+
+                    if user_response.get("error").and_then(|code| code.as_str())
+                        == Some("2FA_too_many_requests")
+                    {
+                        return Err(TradingViewError::TwoFactorCodeTooManyRequests.into());
+                    }
+
                     return Err(TradingViewError::InvalidCredentials.into());
                 }
 
@@ -523,7 +566,7 @@ impl TradingView {
 
         let session_cookie = format!("sessionid={};sessionid_sign={};", session, signature);
 
-        let cookies = vec![HeaderValue::from_str(&session_cookie)?];
+        let cookies = [HeaderValue::from_str(&session_cookie)?];
 
         let mut headers = HeaderMap::new();
         headers.insert("Cookie", cookies[0].clone());
@@ -536,128 +579,88 @@ impl TradingView {
             let id = response_body
                 .split("id\":")
                 .nth(1)
-                .unwrap()
-                .split(',')
-                .next()
-                .unwrap()
-                .parse::<u32>()
-                .unwrap();
+                .and_then(|s| s.split(',').next().and_then(|s| s.parse::<u32>().ok()))
+                .expect("ID not found when parsing user from token");
 
             let username = response_body
                 .split("username\":\"")
                 .nth(1)
-                .unwrap()
-                .split('\"')
-                .next()
-                .unwrap()
+                .and_then(|s| s.split('\"').next())
+                .expect("Username not found when parsing user from token")
                 .to_string();
 
             let first_name = response_body
                 .split("first_name\":\"")
                 .nth(1)
-                .unwrap()
-                .split('\"')
-                .next()
-                .unwrap()
+                .and_then(|s| s.split('\"').next())
+                .expect("First name not found when parsing user from token")
                 .to_string();
 
             let last_name = response_body
                 .split("last_name\":\"")
                 .nth(1)
-                .unwrap()
-                .split('\"')
-                .next()
-                .unwrap()
+                .and_then(|s| s.split('\"').next())
+                .expect("Last name not found when parsing user from token")
                 .to_string();
 
             let reputation = response_body
                 .split("reputation\":")
                 .nth(1)
-                .unwrap()
-                .split(',')
-                .next()
-                .unwrap()
-                .parse::<f64>()
-                .unwrap();
+                .and_then(|s| s.split(',').next().and_then(|s| s.parse::<f64>().ok()))
+                .unwrap_or_default();
 
             let following = response_body
                 .split("following\":")
                 .nth(1)
-                .unwrap()
-                .split(',')
-                .next()
-                .unwrap()
-                .parse::<u32>()
-                .unwrap();
+                .and_then(|s| s.split(',').next().and_then(|s| s.parse::<u32>().ok()))
+                .unwrap_or_default();
 
             let followers = response_body
                 .split("followers\":")
                 .nth(1)
-                .unwrap()
-                .split(',')
-                .next()
-                .unwrap()
-                .parse::<u32>()
-                .unwrap();
+                .and_then(|s| s.split(',').next().and_then(|s| s.parse::<u32>().ok()))
+                .unwrap_or_default();
 
             let is_pro = response_body
                 .split("is_pro\":")
                 .nth(1)
-                .unwrap()
-                .split(',')
-                .next()
-                .unwrap()
-                .parse::<bool>()
-                .unwrap();
+                .and_then(|s| s.split(',').next().and_then(|s| s.parse::<bool>().ok()))
+                .expect("is_pro not found when parsing user from token");
 
             let notifications = response_body
                 .split("notification_count\":")
                 .nth(1)
-                .unwrap()
-                .split(',')
-                .nth(1)
-                .unwrap()
-                .split("user\":")
-                .nth(1)
-                .unwrap()
-                .replace('}', "")
-                .parse::<u32>()
-                .unwrap();
+                .and_then(|s| s.split(',').nth(1))
+                .and_then(|s| s.split("user\":").nth(1))
+                .and_then(|s| s.replace('}', "").parse::<u32>().ok())
+                .expect("notification_count not found when parsing user from token");
 
             let session_hash = response_body
                 .split("session_hash\":\"")
                 .nth(1)
-                .unwrap()
-                .split('\"')
-                .next()
-                .unwrap()
+                .and_then(|s| s.split('\"').next())
+                .expect("session_hash not found when parsing user from token")
                 .to_string();
 
             let private_channel = response_body
                 .split("private_channel\":\"")
                 .nth(1)
-                .unwrap()
-                .split('\"')
-                .next()
-                .unwrap()
+                .and_then(|s| s.split('\"').next())
+                .expect("private_channel not found when parsing user from token")
                 .to_string();
 
             let auth_token = response_body
                 .split("auth_token\":\"")
                 .nth(1)
-                .unwrap()
-                .split('\"')
-                .next()
-                .unwrap()
+                .and_then(|s| s.split('\"').next())
+                .expect("auth_token not found when parsing user from token")
                 .to_string();
 
             let date_joined = response_body
                 .split("date_joined\":\"")
                 .nth(1)
-                .unwrap()
-                .split('\"')
-                .next()
-                .unwrap()
+                .and_then(|s| s.split('\"').next())
+                .expect("date_joined not found when parsing user from token")
                 .to_string();
 
             Ok(User {
@@ -698,13 +701,11 @@ impl TradingView {
                 .filter_map(move |tv_packet| {
                     if tv_packet.packet_type == "qsd"
                         && tv_packet.data.is_some()
-                        && tv_packet.data.clone().unwrap()[1]
+                        && tv_packet.data.as_ref().unwrap()[1]
                             .as_object()
-                            .unwrap()
-                            .get("s")
-                            .unwrap()
-                            .as_str()
-                            .unwrap()
+                            .and_then(|o| o.get("s"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or_default()
                             == "ok"
                     {
                         futures::future::ready(tv_packet.data.and_then(|mut d| d.pop()).and_then(
@@ -784,7 +785,7 @@ impl TradingView {
                             .and_then(|data| data.get("s").map(|s| s.as_array().cloned()))
                             .map(|items| {
                                 items
-                                    .unwrap()
+                                    .unwrap_or_default()
                                     .into_iter()
                                     .flat_map(|item| {
                                         item.get("v").and_then(|v| v.as_array()).cloned()
@@ -890,7 +891,7 @@ mod tests {
                 .server(Some(server.url("")))
                 .build(),
         );
-        let user = tv.login("username", "password", false).await.unwrap();
+        let user = tv.login("username", "password", false, None).await.unwrap();
 
         assert_eq!(user.id, 123);
         assert_eq!(user.username, "test");
@@ -925,7 +926,7 @@ mod tests {
                 .server(Some(server.url("")))
                 .build(),
         )
-        .login("wrong_username", "wrong_password", true)
+        .login("wrong_username", "wrong_password", true, None)
         .await;
         assert!(result.is_err());
 
@@ -967,7 +968,7 @@ mod tests {
                 .server(Some(server.url("")))
                 .build(),
         )
-        .login("username", "password", true)
+        .login("username", "password", true, None)
         .await;
 
         assert!(result.is_err());

@@ -132,7 +132,7 @@ impl WebSocketClient {
                     HeaderValue::from_static("https://s.tradingview.com"),
                 );
 
-                let (ws_stream, _) = connect_async(request).await.unwrap();
+                let (ws_stream, _) = connect_async(request).await?;
 
                 let (write_stream, read_stream) = ws_stream.split();
 
@@ -280,7 +280,12 @@ impl WebSocketClient {
         let packet = TradingViewPacket {
             packet_type: "set_auth_token".to_owned(),
             data: Some(vec![Value::String(
-                self.user.lock().await.clone().unwrap().auth_token,
+                self.user
+                    .lock()
+                    .await
+                    .clone()
+                    .map(|user| user.auth_token)
+                    .unwrap_or_default(),
             )]),
         };
         let msg = format_ws_packet(&Either::Left(packet));

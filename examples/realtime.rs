@@ -18,9 +18,13 @@ async fn main() -> anyhow::Result<()> {
     let trading_view = TradingView::new(client_options);
 
     trading_view
-        .login("username", "password", true, Some(on_two_factor))
-        .await
-        .unwrap();
+        .login(
+            "username",
+            "password",
+            true,
+            Some(tradingview::Either::Right(on_two_factor)),
+        )
+        .await?;
 
     let mut stream = trading_view
         .subscribe_to_symbols(&[

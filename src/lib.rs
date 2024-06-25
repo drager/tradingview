@@ -270,6 +270,9 @@ pub enum TradingViewError {
     #[error("Too many requests for two factor code.")]
     TwoFactorCodeTooManyRequests,
 
+    #[error("Too many requests.")]
+    TooManyRequests,
+
     #[error("Internal server error.")]
     InternalServerError,
 
@@ -316,7 +319,9 @@ impl TradingViewLastPrice {
     }
 }
 
+#[derive(Debug)]
 pub struct TotpSecret(pub String);
+#[derive(Debug)]
 pub struct TwoFactorCode(String);
 
 pub struct TradingView {
@@ -383,7 +388,13 @@ impl TradingView {
         match res.status() {
             StatusCode::UNAUTHORIZED => Err(TradingViewError::InvalidCredentials.into()),
             StatusCode::INTERNAL_SERVER_ERROR => Err(TradingViewError::InternalServerError.into()),
-            s if !s.is_success() => Err(TradingViewError::AuthenticationFailed.into()),
+            s if !s.is_success() => {
+                let error_res: Value = res.json().await?;
+
+                log::error!("Login errored with: {}", error_res);
+
+                Err(TradingViewError::AuthenticationFailed.into())
+            }
             _ => {
                 let cookies = res.cookies().collect::<Vec<_>>();
 
@@ -511,7 +522,33 @@ impl TradingView {
         match res.status() {
             StatusCode::UNAUTHORIZED => Err(TradingViewError::InvalidCredentials.into()),
             StatusCode::INTERNAL_SERVER_ERROR => Err(TradingViewError::InternalServerError.into()),
-            s if !s.is_success() => Err(TradingViewError::AuthenticationFailed.into()),
+            StatusCode::TOO_MANY_REQUESTS => {
+                let error_res: Value = res.json().await?;
+
+                if let Some(error) = error_res.get("code") {
+                    if error.as_str() == Some("2FA_too_many_requests") {
+                        return Err(TradingViewError::TwoFactorCodeTooManyRequests.into());
+                    }
+
+                    return Err(TradingViewError::InvalidCredentials.into());
+                }
+
+                Err(TradingViewError::TooManyRequests.into())
+            }
+            s if !s.is_success() => {
+                let error_res: Value = res.json().await?;
+
+                log::error!("Two factor errored with: {}", error_res);
+
+                if let Some(error) = error_res.get("code") {
+                    if error.as_str() == Some("2FA_invalid_credential") {
+                        return Err(TradingViewError::InvalidTwoFactorCode.into());
+                    }
+                    return Err(TradingViewError::InvalidCredentials.into());
+                }
+
+                return Err(TradingViewError::InvalidCredentials.into());
+            }
             _ => {
                 let cookies = res.cookies().collect::<Vec<_>>();
                 let session_cookie = cookies
@@ -528,18 +565,8 @@ impl TradingView {
 
                 let user_response: Value = res.json().await?;
 
-                if let Some(_error) = user_response.get("error") {
-                    if user_response.get("error").and_then(|code| code.as_str())
-                        == Some("Invalid_code")
-                    {
-                        return Err(TradingViewError::InvalidTwoFactorCode.into());
-                    }
-
-                    if user_response.get("error").and_then(|code| code.as_str())
-                        == Some("2FA_too_many_requests")
-                    {
-                        return Err(TradingViewError::TwoFactorCodeTooManyRequests.into());
-                    }
+                if let Some(error) = user_response.get("error") {
+                    log::error!("Two factor errored with: {}", error);
 
                     return Err(TradingViewError::InvalidCredentials.into());
                 }

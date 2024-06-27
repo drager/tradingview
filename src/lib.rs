@@ -660,7 +660,7 @@ impl TradingView {
                 .and_then(|s| s.split(',').nth(1))
                 .and_then(|s| s.split("user\":").nth(1))
                 .and_then(|s| s.replace('}', "").parse::<u32>().ok())
-                .expect("notification_count not found when parsing user from token");
+                .unwrap_or_default();
 
             let session_hash = response_body
                 .split("session_hash\":\"")

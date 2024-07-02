@@ -137,6 +137,11 @@ impl fmt::Display for Currency {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct Following {
+    legacy_all: u32,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct User {
     id: u32,
@@ -195,7 +200,7 @@ impl User {
     }
 
     pub fn get_notifications(&self) -> u32 {
-        self.notifications.user
+        self.notifications.following.legacy_all
     }
 
     pub fn get_session_hash(&self) -> &str {
@@ -248,7 +253,7 @@ where
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 struct NotificationCount {
-    user: u32,
+    following: Following,
 }
 
 #[derive(Deserialize)]
@@ -547,7 +552,7 @@ impl TradingView {
                     return Err(TradingViewError::InvalidCredentials.into());
                 }
 
-                return Err(TradingViewError::InvalidCredentials.into());
+                Err(TradingViewError::InvalidCredentials.into())
             }
             _ => {
                 let cookies = res.cookies().collect::<Vec<_>>();
@@ -702,7 +707,9 @@ impl TradingView {
                 followers: Some(followers),
                 is_pro,
                 notifications: NotificationCount {
-                    user: notifications,
+                    following: Following {
+                        legacy_all: notifications,
+                    },
                 },
                 session_hash,
                 private_channel,
@@ -903,7 +910,9 @@ mod tests {
                         "followers": 20,
                         "is_pro": true,
                         "notification_count": {
-                            "user": 2
+                            "following": {
+                                "legacy_all": 2
+                            }
                         },
                         "session_hash": "ijkl",
                         "private_channel": "mnop",
@@ -926,8 +935,12 @@ mod tests {
         assert_eq!(user.last_name, "User");
         assert_eq!(user.reputation, 5.0);
         assert_eq!(user.following, Some(10));
-        assert_eq!(user.followers, Some(20));
-        assert_eq!(user.notifications, NotificationCount { user: 2 });
+        assert_eq!(
+            user.notifications,
+            NotificationCount {
+                following: Following { legacy_all: 2 }
+            }
+        );
         assert_eq!(user.session, Some("abcd".to_string()));
         assert_eq!(user.signature, Some("efgh".to_string()));
         assert_eq!(user.session_hash, "ijkl");
@@ -979,7 +992,9 @@ mod tests {
                     "followers": 20,
                     "is_pro": true,
                     "notification_count": {
-                        "user": 2
+                        "following": {
+                            "legacy_all": 2
+                        }
                     },
                     "session_hash": "ijkl",
                     "private_channel": "mnop",
@@ -1013,7 +1028,9 @@ mod tests {
             "followers": 20,
             "is_pro": true,
             "notification_count": {
-                "user": 2
+                "following": {
+                    "legacy_all": 2
+                }
             },
             "session_hash": "ijkl",
             "private_channel": "mnop",

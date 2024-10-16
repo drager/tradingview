@@ -139,7 +139,7 @@ impl fmt::Display for Currency {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 pub struct Following {
-    legacy_all: u32,
+    pubscript_updates: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -152,8 +152,6 @@ pub struct User {
     following: Option<u32>,
     followers: Option<u32>,
     is_pro: bool,
-    #[serde(rename = "notification_count")]
-    notifications: NotificationCount,
     session_hash: String,
     private_channel: String,
     auth_token: String,
@@ -197,10 +195,6 @@ impl User {
 
     pub fn is_pro(&self) -> bool {
         self.is_pro
-    }
-
-    pub fn get_notifications(&self) -> u32 {
-        self.notifications.following.legacy_all
     }
 
     pub fn get_session_hash(&self) -> &str {
@@ -249,11 +243,6 @@ where
     let date_str = String::deserialize(deserializer)?;
 
     deserialize_datetime_string(&date_str).map_err(serde::de::Error::custom)
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
-struct NotificationCount {
-    following: Following,
 }
 
 #[derive(Deserialize)]
@@ -375,7 +364,7 @@ impl TradingView {
 
         let client = reqwest::Client::new();
         let res = client
-            .post(&format!("{}/accounts/signin/", server_url))
+            .post(format!("{}/accounts/signin/", server_url))
             .header(
                 "User-agent",
                 self.client_options.user_agent.as_deref().unwrap_or(concat!(
@@ -518,7 +507,7 @@ impl TradingView {
 
         let client = reqwest::Client::new();
         let res = client
-            .post(&format!("{}/accounts/two-factor/signin/totp/", server_url))
+            .post(format!("{}/accounts/two-factor/signin/totp/", server_url))
             .headers(headers)
             .multipart(form)
             .send()
@@ -659,14 +648,6 @@ impl TradingView {
                 .and_then(|s| s.split(',').next().and_then(|s| s.parse::<bool>().ok()))
                 .expect("is_pro not found when parsing user from token");
 
-            let notifications = response_body
-                .split("notification_count\":")
-                .nth(1)
-                .and_then(|s| s.split(',').nth(1))
-                .and_then(|s| s.split("user\":").nth(1))
-                .and_then(|s| s.replace('}', "").parse::<u32>().ok())
-                .unwrap_or_default();
-
             let session_hash = response_body
                 .split("session_hash\":\"")
                 .nth(1)
@@ -706,11 +687,6 @@ impl TradingView {
                 following: Some(following),
                 followers: Some(followers),
                 is_pro,
-                notifications: NotificationCount {
-                    following: Following {
-                        legacy_all: notifications,
-                    },
-                },
                 session_hash,
                 private_channel,
                 auth_token,
@@ -909,11 +885,6 @@ mod tests {
                         "following": 10,
                         "followers": 20,
                         "is_pro": true,
-                        "notification_count": {
-                            "following": {
-                                "legacy_all": 2
-                            }
-                        },
                         "session_hash": "ijkl",
                         "private_channel": "mnop",
                         "auth_token": "qrst",
@@ -935,13 +906,6 @@ mod tests {
         assert_eq!(user.last_name, "User");
         assert_eq!(user.reputation, 5.0);
         assert_eq!(user.following, Some(10));
-        assert_eq!(
-            user.notifications,
-            NotificationCount {
-                following: Following { legacy_all: 2 }
-            }
-        );
-        assert_eq!(user.session, Some("abcd".to_string()));
         assert_eq!(user.signature, Some("efgh".to_string()));
         assert_eq!(user.session_hash, "ijkl");
         assert_eq!(user.private_channel, "mnop");
@@ -991,11 +955,6 @@ mod tests {
                     "following": 10,
                     "followers": 20,
                     "is_pro": true,
-                    "notification_count": {
-                        "following": {
-                            "legacy_all": 2
-                        }
-                    },
                     "session_hash": "ijkl",
                     "private_channel": "mnop",
                     "auth_token": "qrst",
@@ -1027,11 +986,6 @@ mod tests {
             "following": 10,
             "followers": 20,
             "is_pro": true,
-            "notification_count": {
-                "following": {
-                    "legacy_all": 2
-                }
-            },
             "session_hash": "ijkl",
             "private_channel": "mnop",
             "auth_token": "qrst",

@@ -89,8 +89,10 @@ impl From<&str> for Currency {
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Timeframe {
     OneMinute,
+    TwoMinutes,
     ThreeMinutes,
     FiveMinutes,
+    TenMinutes,
     FifteenMinutes,
     ThirtyMinutes,
     FortyFiveMinutes,
@@ -107,8 +109,10 @@ impl fmt::Display for Timeframe {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let timeframe = match self {
             Timeframe::OneMinute => "1",
+            Timeframe::TwoMinutes => "2",
             Timeframe::ThreeMinutes => "3",
             Timeframe::FiveMinutes => "5",
+            Timeframe::TenMinutes => "10",
             Timeframe::FifteenMinutes => "15",
             Timeframe::ThirtyMinutes => "30",
             Timeframe::FortyFiveMinutes => "45",

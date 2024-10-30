@@ -1,18 +1,17 @@
+use chrono::{Date, NaiveDate, TimeZone};
 use chrono::{DateTime, Utc};
 use futures::lock::Mutex;
 use futures::stream;
 use futures::Stream;
 use futures::StreamExt;
-
 use libreauth::oath::TOTPBuilder;
 use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
 use reqwest::multipart;
-
 use reqwest::StatusCode;
 use reqwest::Url;
-use serde::Deserializer;
 use serde::{Deserialize, Serialize};
+use serde::{Deserializer, Serializer};
 use serde_json::Value;
 use std::fmt;
 use std::str;
@@ -24,6 +23,121 @@ use websocket::WebSocketClient;
 mod websocket;
 
 pub use either::Either;
+
+#[derive(Debug, Serialize, Deserialize, TypedBuilder)]
+pub struct Source {
+    country: String,
+    description: String,
+    #[serde(rename = "exchange-type")]
+    exchange_type: String,
+    id: String,
+    name: String,
+    url: String,
+}
+
+fn deserialize_holiday_dates<'de, D>(deserializer: D) -> Result<Vec<NaiveDate>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let dates_str: String = Deserialize::deserialize(deserializer)?;
+
+    dates_str
+        .split(',')
+        .map(|date_str| {
+            NaiveDate::parse_from_str(date_str, "%Y%m%d").map_err(serde::de::Error::custom)
+        })
+        .collect()
+}
+
+fn serialize_holiday_dates<S>(dates: &Vec<NaiveDate>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let date_strings: Vec<String> = dates
+        .iter()
+        .map(|date| date.format("%Y%m%d").to_string())
+        .collect();
+    serializer.serialize_str(&date_strings.join(","))
+}
+
+fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Deserialize as i64 to handle Unix timestamps
+    let timestamp = i64::deserialize(deserializer)?;
+    Utc.timestamp_opt(timestamp, 0)
+        .single()
+        .ok_or_else(|| serde::de::Error::custom(format!("Invalid Unix timestamp: {}", timestamp)))
+}
+
+fn serialize_timestamp<S>(datetime: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    // Serialize DateTime as Unix timestamp (seconds since epoch)
+    serializer.serialize_i64(datetime.timestamp())
+}
+
+#[derive(Debug, Serialize, Deserialize, TypedBuilder)]
+pub struct Instrument {
+    #[serde(rename = "symbol-primaryname")]
+    ticker_symbol: String,
+    exchange: String,
+    listed_exchange: String,
+    #[serde(rename = "currency_code")]
+    currency: Currency,
+    isin: String,
+    all_time_low: f64,
+    all_time_high: f64,
+    /// This is the price-to-earnings (P/E) ratio based on trailing twelve months (TTM) earnings
+    price_earnings_ttm: f64,
+    /// This represents the forecasted earnings per share for the next fiscal quarter
+    earnings_per_share_forecast_next_fq: f64,
+    /// This is the basic earnings per share (EPS) calculated for the trailing twelve months (TTM).
+    /// Unlike diluted EPS, basic EPS doesn’t account for the impact of convertible securities
+    /// (like stock options or convertible bonds) and is a straightforward measure of net income divided by the total outstanding shares over the last 12 months.
+    earnings_per_share_basic_ttm: f64,
+    /// Forecasted earnings per share (EPS) for the next fiscal quarter
+    earnings_per_share_fq: f64,
+    /// This is the total number of outstanding shares of a company's stock, typically calculated by adding up all the shares owned by shareholders,
+    /// including restricted shares and shares held by institutional investors.
+    total_shares_outstanding_calculated: f64,
+    total_revenue: f64,
+    /// This stands for market capitalization (calculated), which is the total market value of a company's outstanding shares.
+    /// It’s found by multiplying the total shares outstanding by the current stock price, providing a measure of the company’s overall value in the market.
+    market_cap_calc: f64,
+    /// This is basic market capitalization of a company. This figure gives a snapshot of the company's total market value based on its current stock price and the number of shares available to public investors
+    market_cap_basic: f64,
+    /// This represents the dividends per share (DPS) for the primary common stock issue for the fiscal year (FY).
+    /// It shows the amount of dividends paid to each share of common stock over the past fiscal year.
+    dps_common_stock_prim_issue_fy: f64,
+    dividends_yield: f64,
+    /// Represents a stock's beta over the past year. Beta measures the volatility or risk of a stock relative to the overall market.
+    beta_1_year: f64,
+    timezone: String,
+    #[serde(
+        deserialize_with = "deserialize_timestamp",
+        serialize_with = "serialize_timestamp"
+    )]
+    earnings_release_date: DateTime<Utc>,
+    #[serde(
+        deserialize_with = "deserialize_timestamp",
+        serialize_with = "serialize_timestamp"
+    )]
+    earnings_release_next_date: DateTime<Utc>,
+    country_code: String,
+    #[serde(rename = "type")]
+    instrument_type: String,
+
+    #[serde(
+        deserialize_with = "deserialize_holiday_dates",
+        serialize_with = "serialize_holiday_dates"
+    )]
+    session_holidays: Vec<NaiveDate>,
+    #[serde(rename = "source2")]
+    source: Source,
+}
 
 #[derive(Debug, Serialize, Deserialize, TypedBuilder)]
 pub struct TickerSymbol {
@@ -262,6 +376,9 @@ pub enum TradingViewError {
     #[error("Invalid username or password.")]
     InvalidCredentials,
 
+    #[error("Recaptcha required.")]
+    RecapchaRequired,
+
     #[error("Invalid two factor code.")]
     InvalidTwoFactorCode,
 
@@ -432,6 +549,14 @@ impl TradingView {
 
                         return self.two_factor(&code, &user).await;
                     }
+
+                    if let Some(code) = user_response.get("code") {
+                        if code.as_str() == Some("recaptcha_required") {
+                            // TODO: Handle it in this library instead of just returning an error.
+                            return Err(TradingViewError::RecapchaRequired.into());
+                        }
+                    }
+
                     return Err(TradingViewError::InvalidCredentials.into());
                 }
 
@@ -860,6 +985,38 @@ impl TradingView {
         }
 
         Ok(Box::new(Box::pin(stream::iter(items))))
+    }
+
+    pub async fn fetch_instrument(
+        &self,
+        ticker_symbol: &str,
+        currency: &Currency,
+    ) -> anyhow::Result<Instrument> {
+        let websocket = WebSocketClient::new(self.user.clone()).await?;
+
+        let mut data = websocket.fetch_instrument(ticker_symbol, currency).await?;
+
+        while let Some(tv_packet) = data.next().await {
+            if tv_packet.packet_type == "qsd"
+                && tv_packet.data.as_ref().unwrap()[1]
+                    .as_object()
+                    .and_then(|o| o.get("s"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    == "ok"
+            {
+                let instrument = tv_packet.data.and_then(|mut d| d.pop()).and_then(|data| {
+                    data.get("v")
+                        .and_then(|v| serde_json::from_value::<Instrument>(v.clone()).ok())
+                });
+
+                if let Some(instrument) = instrument {
+                    return Ok(instrument);
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("Failed to fetch instrument"))
     }
 }
 

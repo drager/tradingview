@@ -232,6 +232,36 @@ impl WebSocketClient {
         self.listen_to_incoming().await
     }
 
+    pub async fn fetch_instrument(
+        mut self,
+        ticker_symbol: &str,
+        currency: &Currency,
+    ) -> anyhow::Result<Box<dyn Stream<Item = TradingViewPacket> + Unpin + Send>> {
+        self.send_auth_message().await?;
+
+        self.send(&format_ws_packet(&Either::Left(TradingViewPacket {
+            packet_type: "quote_create_session".to_owned(),
+            data: Some(vec![Value::String(self.session_id.clone())]),
+        })))
+        .await?;
+
+        let symbol_key = format!(
+            "={}",
+            serde_json::json!({ "symbol": ticker_symbol, "currency-id": currency, })
+        );
+
+        self.send(&format_ws_packet(&Either::Left(TradingViewPacket {
+            packet_type: "quote_add_symbols".to_owned(),
+            data: Some(vec![
+                Value::String(self.session_id.clone()),
+                Value::String(symbol_key),
+            ]),
+        })))
+        .await?;
+
+        self.listen_to_incoming().await
+    }
+
     async fn listen_to_incoming(
         self,
     ) -> anyhow::Result<Box<dyn Stream<Item = TradingViewPacket> + Unpin + Send>> {
@@ -334,6 +364,11 @@ impl WebSocketClient {
                         log::error!("Critical error: {:?}. Closing websocket connection...", p);
 
                         let _ = write_stream.close().await;
+
+                        return Err(anyhow::anyhow!(format!(
+                            "Critical error: {:?}. Closing websocket connection...",
+                            p
+                        )));
                     }
 
                     if tv_packet.data.is_some() {

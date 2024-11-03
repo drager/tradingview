@@ -1,5 +1,6 @@
 use std::{env, io};
 
+use chrono::DateTime;
 use futures::StreamExt;
 use tradingview::{ClientOptions, Currency, Timeframe, TradingView};
 
@@ -39,10 +40,14 @@ async fn main() -> anyhow::Result<()> {
     for ohlc in data.iter_mut() {
         let date = ohlc.get_timestamp();
 
-        println!("date: {}", date);
         println!(
-            "{} {} {} {} {} {}",
-            &ohlc.get_timestamp(),
+            "date: {}",
+            DateTime::from_timestamp(date as i64, 0)
+                .ok_or_else(|| anyhow::anyhow!("Invalid date"))?
+                .format("%Y-%m-%d %H:%M:%S")
+        );
+        println!(
+            "O: {} H: {} L: {} C: {} V: {}",
             &ohlc.get_open(),
             &ohlc.get_high(),
             &ohlc.get_low(),

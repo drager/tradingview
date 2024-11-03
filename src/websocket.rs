@@ -1,6 +1,6 @@
+use anyhow::anyhow;
 use either::Either;
 use futures::lock::Mutex;
-use futures::stream;
 use futures::stream::SplitSink;
 use futures::stream::SplitStream;
 use futures::SinkExt;
@@ -52,31 +52,52 @@ fn parse_ws_packet(data: &str) -> anyhow::Result<Vec<Either<TradingViewPacket, i
     log::debug!("Raw packet from websocket: {}", data);
 
     let replace_regex = Regex::new(r"~h~")?;
-    let split_regex = Regex::new(r"~m~[0-9]{1,}~m~")?;
+    let split_regex = Regex::new(r"~m~\d+~m~")?;
 
+    // Remove heartbeat messages
     let cleaned = replace_regex.replace_all(data, "");
 
-    let cleaned = cleaned
-        .replace(r#":"={"#, r#":"{"#)
-        .replace(r#","p":[{""#, r#","p":[{}"#);
+    // Split the cleaned data into separate packets
+    let packets = split_regex.split(&cleaned);
 
-    let data: Vec<Either<TradingViewPacket, i32>> = split_regex
-        .split(&cleaned)
+    let data: Vec<Either<TradingViewPacket, i32>> = packets
         .filter(|p| !p.is_empty())
-        .filter_map(|p| match serde_json::from_str::<TradingViewPacket>(p) {
-            Ok(packet) => Some(Either::Left(packet)),
-            Err(json_err) => match p.parse::<i32>() {
-                Ok(number) => Some(Either::Right(number)),
-                Err(err) => {
-                    log::debug!(
-                        "Failed to parse packet as json or number: {}, {}, {}",
-                        p,
-                        json_err,
-                        err
-                    );
-                    None
+        .filter_map(|p| {
+            let clean_packet = if p.starts_with("={") {
+                p.replacen("={", "{", 1)
+            } else {
+                p.to_string()
+            };
+
+            match serde_json::from_str::<TradingViewPacket>(&clean_packet) {
+                Ok(mut packet) => {
+                    // Post-process `n` field to remove leading `=` if present
+                    if let Some(Value::String(n_value)) = packet
+                        .data
+                        .as_mut()
+                        .and_then(|p| p.get_mut(1))
+                        .and_then(|v| v.get_mut("n"))
+                    {
+                        if n_value.starts_with('=') {
+                            // Remove the leading `=`
+                            *n_value = n_value[1..].to_string();
+                        }
+                    }
+                    Some(Either::Left(packet))
                 }
-            },
+                Err(json_err) => match clean_packet.parse::<i32>() {
+                    Ok(number) => Some(Either::Right(number)),
+                    Err(err) => {
+                        log::debug!(
+                            "Failed to parse packet as json or number: {}, {}, {}",
+                            clean_packet,
+                            json_err,
+                            err
+                        );
+                        None
+                    }
+                },
+            }
         })
         .collect();
 
@@ -160,7 +181,8 @@ impl WebSocketClient {
     pub async fn subscribe(
         mut self,
         ticker_symbols: &[TickerSymbol],
-    ) -> anyhow::Result<Box<dyn Stream<Item = TradingViewPacket> + Unpin + Send>> {
+    ) -> anyhow::Result<Box<dyn Stream<Item = anyhow::Result<TradingViewPacket>> + Unpin + Send>>
+    {
         self.send_auth_message().await?;
 
         self.send(&format_ws_packet(&Either::Left(TradingViewPacket {
@@ -194,7 +216,8 @@ impl WebSocketClient {
         timeframe: Timeframe,
         range: u32,
         currency: &Currency,
-    ) -> anyhow::Result<Box<dyn Stream<Item = TradingViewPacket> + Unpin + Send>> {
+    ) -> anyhow::Result<Box<dyn Stream<Item = anyhow::Result<TradingViewPacket>> + Unpin + Send>>
+    {
         self.send(&format_ws_packet(&Either::Left(TradingViewPacket {
             packet_type: "chart_create_session".to_owned(),
             data: Some(vec![Value::String(self.session_id.clone())]),
@@ -232,11 +255,11 @@ impl WebSocketClient {
         self.listen_to_incoming().await
     }
 
-    pub async fn fetch_instrument(
+    pub async fn fetch_instruments(
         mut self,
-        ticker_symbol: &str,
-        currency: &Currency,
-    ) -> anyhow::Result<Box<dyn Stream<Item = TradingViewPacket> + Unpin + Send>> {
+        ticker_symbols: &[TickerSymbol],
+    ) -> anyhow::Result<Box<dyn Stream<Item = anyhow::Result<TradingViewPacket>> + Unpin + Send>>
+    {
         self.send_auth_message().await?;
 
         self.send(&format_ws_packet(&Either::Left(TradingViewPacket {
@@ -245,65 +268,74 @@ impl WebSocketClient {
         })))
         .await?;
 
-        let symbol_key = format!(
-            "={}",
-            serde_json::json!({ "symbol": ticker_symbol, "currency-id": currency, })
-        );
+        let mut data = vec![Value::String(self.session_id.clone())];
 
-        self.send(&format_ws_packet(&Either::Left(TradingViewPacket {
+        for ticker in ticker_symbols {
+            data.push(Value::String(ticker.symbol.clone()));
+        }
+
+        let tv_packet = TradingViewPacket {
             packet_type: "quote_add_symbols".to_owned(),
-            data: Some(vec![
-                Value::String(self.session_id.clone()),
-                Value::String(symbol_key),
-            ]),
-        })))
-        .await?;
+            data: Some(data),
+        };
+
+        self.send(&format_ws_packet(&Either::Left(tv_packet)))
+            .await?;
 
         self.listen_to_incoming().await
     }
 
-    async fn listen_to_incoming(
+    pub async fn listen_to_incoming(
         self,
-    ) -> anyhow::Result<Box<dyn Stream<Item = TradingViewPacket> + Unpin + Send>> {
+    ) -> anyhow::Result<Box<dyn Stream<Item = anyhow::Result<TradingViewPacket>> + Unpin + Send>>
+    {
         let Self {
-            read_stream,
+            mut read_stream,
             write_stream,
             ..
         } = self;
 
         let write_stream = Arc::new(Mutex::new(write_stream));
 
-        let data_stream = read_stream
-            .then(move |msg| {
-                let write_stream = write_stream.clone();
+        let data_stream = async_stream::stream! {
+            loop {
+                match read_stream.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let mut write_stream = write_stream.lock().await;
 
-                async move {
-                    match msg {
-                        Ok(Message::Text(text)) => {
-                            let mut write_stream = write_stream.lock().await;
-
-                            Self::handle_ws_package(&text, &mut write_stream)
-                                .await
-                                .unwrap_or_default()
-                        }
-                        Ok(Message::Close(reason)) => {
-                            log::warn!("Websocket connection closed by server: {:?}", reason);
-                            Vec::new()
-                        }
-                        Err(e) => {
-                            log::error!("Error reading websocket message: {}", e);
-                            Vec::new()
-                        }
-                        _ => {
-                            log::warn!("Unknown websocket message {:?}", msg);
-                            Vec::new()
+                        match Self::handle_ws_package(&text, &mut write_stream).await {
+                            Ok(packets) => {
+                               for packet in packets {
+                                    log::debug!("Received packet: {:?}", packet);
+                                    yield Ok(packet);
+                                }
+                            },
+                            Err(e) => {
+                                yield Err(e);
+                                break;
+                            }
                         }
                     }
+                    Some(Ok(Message::Close(reason))) => {
+                        log::error!("WebSocket connection closed by server: {:?}", reason);
+                        yield Err(anyhow!("WebSocket connection closed by server"));
+                        break;
+                    }
+                    Some(Ok(_)) => {
+                        log::warn!("Received unhandled WebSocket message type");
+                    }
+                    Some(Err(e)) => {
+                        log::error!("Error reading WebSocket message: {}", e);
+                        yield Err(anyhow!("Error reading WebSocket message"));
+                    }
+                    None => {
+                        log::warn!("WebSocket stream ended unexpectedly, attempting to reconnect...");
+                    }
                 }
-            })
-            .flat_map(stream::iter);
+            }
+        };
 
-        Ok(Box::new(Box::pin(data_stream)))
+        Ok(Box::new(data_stream.boxed()))
     }
 
     async fn send_auth_message(&mut self) -> anyhow::Result<()> {
@@ -351,7 +383,7 @@ impl WebSocketClient {
     ) -> anyhow::Result<Vec<TradingViewPacket>> {
         let packets = parse_ws_packet(data)?;
 
-        let mut results = vec![];
+        let mut processed_packets = Vec::new();
 
         for packet in packets {
             match packet {
@@ -371,15 +403,32 @@ impl WebSocketClient {
                         )));
                     }
 
-                    if tv_packet.data.is_some() {
-                        results.push(tv_packet);
+                    if let Some(data) = &tv_packet.data {
+                        if let Some(Value::Object(obj)) = data.get(1) {
+                            if let Some(Value::String(s)) = obj.get("s") {
+                                if s == "error" {
+                                    log::error!("Error in packet: {:?}", tv_packet);
+
+                                    return Err(anyhow::anyhow!(
+                                        "Error in packet: {:?}",
+                                        tv_packet
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        log::warn!("Packet missing expected data field: {:?}", tv_packet);
                     }
+
+                    processed_packets.push(tv_packet);
                 }
-                // Ping
-                Either::Right(ping_number) => Self::ping(ping_number, write_stream).await?,
+                Either::Right(ping_number) => {
+                    Self::ping(ping_number, write_stream).await?;
+                }
             }
         }
-        Ok(results)
+
+        Ok(processed_packets)
     }
 }
 
@@ -494,6 +543,57 @@ mod tests {
             );
         } else {
             panic!("Parsed data did not contain a TradingViewPacket",);
+        }
+    }
+
+    #[test]
+    fn test_parse_ws_packet_multiple() {
+        let data = r#"~m~114~m~{"m":"qsd","p":["xs_kujC8txR2L01",{"n":"OMXSTO:OMXS30","s":"ok","v":{"minute_loaded":true,"lp_time":1730462340}}]}~m~92~m~{"m":"qsd","p":["xs_kujC8txR2L01",{"n":"OMXSTO:OMXS30","s":"ok","v":{"trade_loaded":true}}]}~m~3295~m~{"m":"qsd","p":["xs_kujC8txR2L01",{"n":"OMXSTO:OMXS30","s":"ok","v":{"first_bar_time_1d":528422400,"regular_close":2542.4079}}]}~m~97~m~{"m":"qsd","p":["xs_kujC8txR2L01",{"n":"OMXSTO:OMXS30","s":"ok","v":{"fundamental_data":false}}]}~m~63~m~{"m":"quote_completed","p":["xs_kujC8txR2L01","OMXSTO:OMXS30"]}"#;
+
+        let parsed_packets = parse_ws_packet(data).unwrap();
+
+        // Check that we have 5 packets
+        assert_eq!(parsed_packets.len(), 5, "Expected 5 packets");
+
+        // Check the packet type for each parsed packet and confirm key data
+        if let Either::Left(packet1) = &parsed_packets[0] {
+            assert_eq!(packet1.packet_type, "qsd");
+            assert!(packet1.data.is_some());
+            let p_data = packet1.data.as_ref().unwrap();
+            assert_eq!(p_data[0], Value::String("xs_kujC8txR2L01".to_string()));
+        } else {
+            panic!("Packet 1 did not parse as expected");
+        }
+
+        if let Either::Left(packet2) = &parsed_packets[1] {
+            assert_eq!(packet2.packet_type, "qsd");
+            assert!(packet2.data.is_some());
+        } else {
+            panic!("Packet 2 did not parse as expected");
+        }
+
+        if let Either::Left(packet3) = &parsed_packets[2] {
+            assert_eq!(packet3.packet_type, "qsd");
+            assert!(packet3.data.is_some());
+        } else {
+            panic!("Packet 3 did not parse as expected");
+        }
+
+        if let Either::Left(packet4) = &parsed_packets[3] {
+            assert_eq!(packet4.packet_type, "qsd");
+            assert!(packet4.data.is_some());
+        } else {
+            panic!("Packet 4 did not parse as expected");
+        }
+
+        if let Either::Left(packet5) = &parsed_packets[4] {
+            assert_eq!(packet5.packet_type, "quote_completed");
+            assert!(packet5.data.is_some());
+            let p_data = packet5.data.as_ref().unwrap();
+            assert_eq!(p_data[0], Value::String("xs_kujC8txR2L01".to_string()));
+            assert_eq!(p_data[1], Value::String("OMXSTO:OMXS30".to_string()));
+        } else {
+            panic!("Packet 5 did not parse as expected");
         }
     }
 

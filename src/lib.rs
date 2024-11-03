@@ -1,5 +1,6 @@
-use chrono::{Date, NaiveDate, TimeZone};
+use chrono::serde::ts_seconds;
 use chrono::{DateTime, Utc};
+use chrono::{NaiveDate, TimeZone};
 use futures::lock::Mutex;
 use futures::stream;
 use futures::Stream;
@@ -13,6 +14,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde::{Deserializer, Serializer};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fmt;
 use std::str;
 use std::sync::Arc;
@@ -60,7 +62,7 @@ where
     serializer.serialize_str(&date_strings.join(","))
 }
 
-fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -68,75 +70,117 @@ where
     let timestamp = i64::deserialize(deserializer)?;
     Utc.timestamp_opt(timestamp, 0)
         .single()
+        .map(|ts| Some(ts))
         .ok_or_else(|| serde::de::Error::custom(format!("Invalid Unix timestamp: {}", timestamp)))
 }
 
-fn serialize_timestamp<S>(datetime: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_timestamp<S>(
+    datetime: &Option<DateTime<Utc>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     // Serialize DateTime as Unix timestamp (seconds since epoch)
-    serializer.serialize_i64(datetime.timestamp())
+    match datetime {
+        Some(dt) => ts_seconds::serialize(dt, serializer),
+        _ => unreachable!(),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, TypedBuilder)]
 pub struct Instrument {
-    #[serde(rename = "symbol-primaryname")]
-    ticker_symbol: String,
-    exchange: String,
-    listed_exchange: String,
-    #[serde(rename = "currency_code")]
-    currency: Currency,
-    isin: String,
-    all_time_low: f64,
-    all_time_high: f64,
+    #[serde(skip_deserializing)]
+    pub ticker_symbol: String,
+    pub short_description: String,
+    pub exchange: String,
+    pub listed_exchange: String,
+    #[serde(alias = "currency_code", alias = "currency-id")]
+    pub currency: Currency,
+    pub isin: Option<String>,
     /// This is the price-to-earnings (P/E) ratio based on trailing twelve months (TTM) earnings
-    price_earnings_ttm: f64,
+    pub price_earnings_ttm: Option<f64>,
     /// This represents the forecasted earnings per share for the next fiscal quarter
-    earnings_per_share_forecast_next_fq: f64,
+    pub earnings_per_share_forecast_next_fq: Option<f64>,
     /// This is the basic earnings per share (EPS) calculated for the trailing twelve months (TTM).
     /// Unlike diluted EPS, basic EPS doesn’t account for the impact of convertible securities
     /// (like stock options or convertible bonds) and is a straightforward measure of net income divided by the total outstanding shares over the last 12 months.
-    earnings_per_share_basic_ttm: f64,
+    pub earnings_per_share_basic_ttm: Option<f64>,
     /// Forecasted earnings per share (EPS) for the next fiscal quarter
-    earnings_per_share_fq: f64,
+    pub earnings_per_share_fq: Option<f64>,
     /// This is the total number of outstanding shares of a company's stock, typically calculated by adding up all the shares owned by shareholders,
     /// including restricted shares and shares held by institutional investors.
-    total_shares_outstanding_calculated: f64,
-    total_revenue: f64,
+    pub total_shares_outstanding_calculated: Option<f64>,
+    pub total_revenue: Option<f64>,
     /// This stands for market capitalization (calculated), which is the total market value of a company's outstanding shares.
     /// It’s found by multiplying the total shares outstanding by the current stock price, providing a measure of the company’s overall value in the market.
-    market_cap_calc: f64,
+    pub market_cap_calc: Option<f64>,
     /// This is basic market capitalization of a company. This figure gives a snapshot of the company's total market value based on its current stock price and the number of shares available to public investors
-    market_cap_basic: f64,
+    pub market_cap_basic: Option<f64>,
     /// This represents the dividends per share (DPS) for the primary common stock issue for the fiscal year (FY).
     /// It shows the amount of dividends paid to each share of common stock over the past fiscal year.
-    dps_common_stock_prim_issue_fy: f64,
-    dividends_yield: f64,
+    pub dps_common_stock_prim_issue_fy: Option<f64>,
+    pub dividends_yield: Option<f64>,
     /// Represents a stock's beta over the past year. Beta measures the volatility or risk of a stock relative to the overall market.
-    beta_1_year: f64,
-    timezone: String,
+    pub beta_1_year: Option<f64>,
+    pub volume: Option<f64>,
+    pub average_volume: Option<f64>,
+    pub price_52_week_low: Option<f64>,
+    pub price_52_week_high: Option<f64>,
+    pub all_time_low: Option<f64>,
+    pub all_time_high: Option<f64>,
+    pub prev_close_price: Option<f64>,
+    #[serde(alias = "open_price")]
+    pub open: f64,
+    #[serde(alias = "high_price")]
+    pub high: f64,
+    #[serde(alias = "low_price")]
+    pub low: f64,
+    pub regular_close: Option<f64>,
+    #[serde(rename = "ch")]
+    pub change: f64,
+    #[serde(rename = "chp")]
+    pub change_percent: f64,
+    pub timezone: String,
     #[serde(
         deserialize_with = "deserialize_timestamp",
-        serialize_with = "serialize_timestamp"
+        serialize_with = "serialize_timestamp",
+        skip_serializing_if = "Option::is_none"
     )]
-    earnings_release_date: DateTime<Utc>,
+    #[serde(default)]
+    pub earnings_release_date: Option<DateTime<Utc>>,
     #[serde(
         deserialize_with = "deserialize_timestamp",
-        serialize_with = "serialize_timestamp"
+        serialize_with = "serialize_timestamp",
+        skip_serializing_if = "Option::is_none"
     )]
-    earnings_release_next_date: DateTime<Utc>,
-    country_code: String,
+    #[serde(default)]
+    pub earnings_release_next_date: Option<DateTime<Utc>>,
+    #[serde(
+        deserialize_with = "deserialize_timestamp",
+        serialize_with = "serialize_timestamp",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[serde(default)]
+    pub open_time: Option<DateTime<Utc>>,
+    #[serde(
+        deserialize_with = "deserialize_timestamp",
+        serialize_with = "serialize_timestamp",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[serde(default)]
+    pub regular_close_time: Option<DateTime<Utc>>,
+    pub country_code: Option<String>,
     #[serde(rename = "type")]
-    instrument_type: String,
-
+    pub instrument_type: String,
     #[serde(
         deserialize_with = "deserialize_holiday_dates",
         serialize_with = "serialize_holiday_dates"
     )]
-    session_holidays: Vec<NaiveDate>,
-    #[serde(rename = "source2")]
-    source: Source,
+    #[serde(default)]
+    pub session_holidays: Vec<NaiveDate>,
+    #[serde(alias = "source2")]
+    pub source: Source,
 }
 
 #[derive(Debug, Serialize, Deserialize, TypedBuilder)]
@@ -834,66 +878,73 @@ impl TradingView {
         let websocket = WebSocketClient::new(self.user.clone()).await?;
 
         Ok(Box::new(
-            websocket
-                .subscribe(ticker_symbols)
-                .await?
-                .filter_map(move |tv_packet| {
-                    if tv_packet.packet_type == "qsd"
-                        && tv_packet.data.is_some()
-                        && tv_packet.data.as_ref().unwrap()[1]
-                            .as_object()
-                            .and_then(|o| o.get("s"))
-                            .and_then(|s| s.as_str())
-                            .unwrap_or_default()
-                            == "ok"
-                    {
-                        futures::future::ready(tv_packet.data.and_then(|mut d| d.pop()).and_then(
-                            |data| {
-                                data.as_object().and_then(|data| {
-                                    let symbol = serde_json::from_str::<Value>(
-                                        data.get("n").and_then(|s| s.as_str()).unwrap_or_default(),
-                                    )
-                                    .map(|s| {
-                                        s.get("symbol")
-                                            .and_then(|s| s.as_str())
-                                            .unwrap_or_default()
-                                            .to_string()
-                                    })
-                                    .ok();
-                                    let v = data.get("v").and_then(|v| v.as_object());
-                                    let price = v?.get("lp").and_then(|p| p.as_f64());
-                                    let change = v?.get("ch").and_then(|c| c.as_f64());
-                                    let change_percent = v?.get("chp").and_then(|c| c.as_f64());
-                                    let timestamp = v?
-                                        .get("lp_time")
-                                        .and_then(|t| t.as_u64())
-                                        .unwrap_or(chrono::Utc::now().timestamp_millis() as u64);
+            websocket.subscribe(ticker_symbols).await?.filter_map(
+                move |tv_packet| match tv_packet {
+                    Ok(packet) => {
+                        if packet.packet_type == "qsd"
+                            && packet.data.is_some()
+                            && packet.data.as_ref().unwrap()[1]
+                                .as_object()
+                                .and_then(|o| o.get("s"))
+                                .and_then(|s| s.as_str())
+                                .unwrap_or_default()
+                                == "ok"
+                        {
+                            futures::future::ready(packet.data.and_then(|mut d| d.pop()).and_then(
+                                |data| {
+                                    data.as_object().and_then(|data| {
+                                        let symbol = serde_json::from_str::<Value>(
+                                            data.get("n")
+                                                .and_then(|s| s.as_str())
+                                                .unwrap_or_default(),
+                                        )
+                                        .map(|s| {
+                                            s.get("symbol")
+                                                .and_then(|s| s.as_str())
+                                                .unwrap_or_default()
+                                                .to_string()
+                                        })
+                                        .ok();
+                                        let v = data.get("v").and_then(|v| v.as_object());
+                                        let price = v?.get("lp").and_then(|p| p.as_f64());
+                                        let change = v?.get("ch").and_then(|c| c.as_f64());
+                                        let change_percent = v?.get("chp").and_then(|c| c.as_f64());
+                                        let timestamp =
+                                            v?.get("lp_time").and_then(|t| t.as_u64()).unwrap_or(
+                                                chrono::Utc::now().timestamp_millis() as u64,
+                                            );
 
-                                    let volume = v?
-                                        .get("volume")
-                                        .and_then(|v| v.as_f64())
-                                        .unwrap_or_default();
+                                        let volume = v?
+                                            .get("volume")
+                                            .and_then(|v| v.as_f64())
+                                            .unwrap_or_default();
 
-                                    match (symbol, price, change) {
-                                        (Some(symbol), Some(price), Some(change)) => {
-                                            Some(TradingViewLastPrice {
-                                                symbol,
-                                                price,
-                                                change,
-                                                change_percent,
-                                                timestamp,
-                                                volume,
-                                            })
+                                        match (symbol, price, change) {
+                                            (Some(symbol), Some(price), Some(change)) => {
+                                                Some(TradingViewLastPrice {
+                                                    symbol,
+                                                    price,
+                                                    change,
+                                                    change_percent,
+                                                    timestamp,
+                                                    volume,
+                                                })
+                                            }
+                                            _ => None,
                                         }
-                                        _ => None,
-                                    }
-                                })
-                            },
-                        ))
-                    } else {
-                        futures::future::ready(None)
+                                    })
+                                },
+                            ))
+                        } else {
+                            futures::future::ready(None)
+                        }
                     }
-                }),
+                    Err(e) => {
+                        log::error!("Error in websocket: {}", e);
+                        panic!("Error in websocket: {}", e)
+                    }
+                },
+            ),
         ))
     }
 
@@ -912,7 +963,7 @@ impl TradingView {
 
         let mut items = vec![];
 
-        while let Some(tv_packet) = data.next().await {
+        while let Some(Ok(tv_packet)) = data.next().await {
             if tv_packet.packet_type == "timescale_update" && tv_packet.data.is_some() {
                 let prices = tv_packet
                     .data
@@ -987,36 +1038,95 @@ impl TradingView {
         Ok(Box::new(Box::pin(stream::iter(items))))
     }
 
-    pub async fn fetch_instrument(
+    pub async fn fetch_instruments(
         &self,
-        ticker_symbol: &str,
-        currency: &Currency,
-    ) -> anyhow::Result<Instrument> {
+        ticker_symbols: &[TickerSymbol],
+    ) -> anyhow::Result<Box<dyn Stream<Item = anyhow::Result<Instrument>> + Unpin + Send + '_>>
+    {
         let websocket = WebSocketClient::new(self.user.clone()).await?;
+        let mut data = websocket.fetch_instruments(ticker_symbols).await?;
 
-        let mut data = websocket.fetch_instrument(ticker_symbol, currency).await?;
+        // Set to track tickers that have already been yielded, to prevent not returning when we
+        // have what we want.
+        let mut yielded_tickers = HashSet::new();
 
-        while let Some(tv_packet) = data.next().await {
-            if tv_packet.packet_type == "qsd"
-                && tv_packet.data.as_ref().unwrap()[1]
-                    .as_object()
-                    .and_then(|o| o.get("s"))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or_default()
-                    == "ok"
-            {
-                let instrument = tv_packet.data.and_then(|mut d| d.pop()).and_then(|data| {
-                    data.get("v")
-                        .and_then(|v| serde_json::from_value::<Instrument>(v.clone()).ok())
-                });
+        let target_tickers: HashSet<_> = ticker_symbols
+            .iter()
+            .map(|ticker| ticker.symbol.to_string())
+            .collect();
 
-                if let Some(instrument) = instrument {
-                    return Ok(instrument);
+        let mut number_of_errors = 0;
+
+        let instrument_stream = async_stream::stream! {
+            while yielded_tickers.len() < target_tickers.len() {
+                if let Some(Ok(tv_packet)) = data.next().await {
+                    if tv_packet.packet_type == "qsd" {
+                        for item in tv_packet.data.as_ref().unwrap() {
+                            if item
+                                .as_object()
+                                .and_then(|o| o.get("s"))
+                                .and_then(|s| s.as_str())
+                                .unwrap_or_default()
+                                == "ok"
+                            {
+                                if let Some(ref data_vec) = tv_packet.data {
+                                    // Extract the ticker symbol (field "n") from data_vec[0]
+                                    if let Some(Value::String(ticker)) =
+                                        data_vec.get(1).and_then(|d| d.get("n").cloned())
+                                    {
+                                        // Extract the main instrument data (field "v") from data_vec[1]
+                                        if let Some(instrument_data) =
+                                            data_vec.get(1).and_then(|d| d.get("v").cloned())
+                                        {
+                                            match serde_json::from_value::<Instrument>(instrument_data)
+                                            {
+                                                Ok(mut instrument) => {
+                                                    // Manually set the ticker symbol after deserialization
+                                                    instrument.ticker_symbol = ticker.to_string();
+
+                                                    // Only yield if we haven't yielded this ticker yet
+                                                    if !yielded_tickers.contains(&ticker) {
+                                                        yield Ok(instrument);
+
+                                                        yielded_tickers.insert(ticker.clone());
+
+                                                        // Exit if we've yielded all requested tickers
+                                                        if yielded_tickers == target_tickers {
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    log::debug!(
+                                                        "Failed to deserialize instrument data: {}",
+                                                        e
+                                                    );
+                                                    number_of_errors += 1;
+
+                                                    // Prevent websocket from getting stuck when
+                                                    // trying to deserialize invalid data.
+                                                    if number_of_errors > 20 {
+                                                        yield Err(anyhow::anyhow!(
+                                                            "Failed too many times. Giving up."
+                                                        ));
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if let Some(Err(e)) = data.next().await {
+                                    yield Err(e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
             }
-        }
+        };
 
-        Err(anyhow::anyhow!("Failed to fetch instrument"))
+        Ok(Box::new(Box::pin(instrument_stream)))
     }
 }
 

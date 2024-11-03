@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
                 .currency(Currency::Sek)
                 .build(),
             TickerSymbol::builder()
-                .symbol("BITSTAMP:BTCUSD".to_string())
+                .symbol("COINBASE:BTCUSD".to_string())
                 .currency(Currency::Usd)
                 .build(),
         ])

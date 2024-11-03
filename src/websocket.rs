@@ -63,7 +63,9 @@ fn parse_ws_packet(data: &str) -> anyhow::Result<Vec<Either<TradingViewPacket, i
     let data: Vec<Either<TradingViewPacket, i32>> = packets
         .filter(|p| !p.is_empty())
         .filter_map(|p| {
-            let clean_packet = if p.starts_with("={") {
+            let clean_packet = if !p.contains(r#""m":"#) && p.contains(r#""p":["#) {
+                format!(r#"{{"m":"m",{}}}"#, &p[1..p.len().saturating_sub(1)])
+            } else if p.starts_with("={") {
                 p.replacen("={", "{", 1)
             } else {
                 p.to_string()
@@ -128,12 +130,6 @@ pub struct WebSocketClient {
 
 impl WebSocketClient {
     /// Create a new instance of the WebSocketClient struct
-    //
-    /// # Example
-    /// ```
-    /// let user = User::new("username", "password").await?;
-    /// let client = WebSocketClient::new(Arc::new(Mutex::new(Some(user)))).await?;
-    /// ```
     pub async fn new(user: Arc<Mutex<Option<User>>>) -> anyhow::Result<Self> {
         let user = user.lock().await.clone();
 
@@ -170,14 +166,8 @@ impl WebSocketClient {
     }
 
     /// Subscribe to a ticker symbol
-    /// # Example
-    /// ```
-    /// let user = User::new("username", "password").await?;
     ///
-    /// let mut client = WebSocketClient::new(Arc::new(Mutex::new(Some(user)))).await?;
-    ///
-    /// client.subscribe("AAPL").await?;
-    /// ```
+    /// This function allows subscribing to real-time price updates.
     pub async fn subscribe(
         mut self,
         ticker_symbols: &[TickerSymbol],

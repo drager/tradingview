@@ -22,7 +22,7 @@ regex = "1.8.3"
 either = { version = "1.8.1", features = ["serde"]}
 log = "0.4.18"
 rand = "0.8.5"
-libreauth = { git = "https://github.com/breard-r/libreauth/", branch = "main" }
+libreauth = "0.17.0"
 env_logger = "0.11.5"
 async-stream = "0.3.6"
 

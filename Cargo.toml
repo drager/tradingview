@@ -8,7 +8,7 @@ repository = "https://github.com/drager/tradingview.git"
 license = "Apache-2.0"
 
 [dependencies]
-reqwest = { version = "0.11.4", features = ["json", "multipart", "cookies"] }
+reqwest = { version = "0.12.9", features = ["json", "multipart", "cookies"] }
 anyhow = "1.0.42"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -22,7 +22,7 @@ regex = "1.8.3"
 either = { version = "1.8.1", features = ["serde"]}
 log = "0.4.18"
 rand = "0.8.5"
-libreauth = "0.16.0"
+libreauth = { git = "https://github.com/breard-r/libreauth/", branch = "main" }
 env_logger = "0.11.5"
 async-stream = "0.3.6"
 

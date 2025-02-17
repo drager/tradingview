@@ -51,7 +51,7 @@ where
         .collect()
 }
 
-fn serialize_holiday_dates<S>(dates: &Vec<NaiveDate>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_holiday_dates<S>(dates: &[NaiveDate], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -70,7 +70,7 @@ where
     let timestamp = i64::deserialize(deserializer)?;
     Utc.timestamp_opt(timestamp, 0)
         .single()
-        .map(|ts| Some(ts))
+        .map(Some)
         .ok_or_else(|| serde::de::Error::custom(format!("Invalid Unix timestamp: {}", timestamp)))
 }
 
@@ -308,8 +308,6 @@ pub struct Following {
 pub struct User {
     id: u32,
     username: String,
-    first_name: String,
-    last_name: String,
     reputation: f64,
     following: Option<u32>,
     followers: Option<u32>,
@@ -333,14 +331,6 @@ impl User {
 
     pub fn get_username(&self) -> &str {
         &self.username
-    }
-
-    pub fn get_first_name(&self) -> &str {
-        &self.first_name
-    }
-
-    pub fn get_last_name(&self) -> &str {
-        &self.last_name
     }
 
     pub fn get_reputation(&self) -> f64 {
@@ -783,20 +773,6 @@ impl TradingView {
                 .expect("Username not found when parsing user from token")
                 .to_string();
 
-            let first_name = response_body
-                .split("first_name\":\"")
-                .nth(1)
-                .and_then(|s| s.split('\"').next())
-                .expect("First name not found when parsing user from token")
-                .to_string();
-
-            let last_name = response_body
-                .split("last_name\":\"")
-                .nth(1)
-                .and_then(|s| s.split('\"').next())
-                .expect("Last name not found when parsing user from token")
-                .to_string();
-
             let reputation = response_body
                 .split("reputation\":")
                 .nth(1)
@@ -852,8 +828,6 @@ impl TradingView {
             Ok(User {
                 id,
                 username,
-                first_name,
-                last_name,
                 session: Some(session.to_string()),
                 signature: Some(signature.to_string()),
                 reputation,
@@ -1150,8 +1124,6 @@ mod tests {
                     "user": {
                         "id": 123,
                         "username": "test",
-                        "first_name": "Test",
-                        "last_name": "User",
                         "reputation": 5.0,
                         "following": 10,
                         "followers": 20,
@@ -1173,8 +1145,6 @@ mod tests {
 
         assert_eq!(user.id, 123);
         assert_eq!(user.username, "test");
-        assert_eq!(user.first_name, "Test");
-        assert_eq!(user.last_name, "User");
         assert_eq!(user.reputation, 5.0);
         assert_eq!(user.following, Some(10));
         assert_eq!(user.signature, Some("efgh".to_string()));
@@ -1220,8 +1190,6 @@ mod tests {
                 "user": {
                     "id": 123,
                     "username": "test",
-                    "first_name": "Test",
-                    "last_name": "User",
                     "reputation": 5.0,
                     "following": 10,
                     "followers": 20,
@@ -1251,8 +1219,6 @@ mod tests {
         let json = r#"{
             "id": 123,
             "username": "test",
-            "first_name": "Test",
-            "last_name": "User",
             "reputation": 5.0,
             "following": 10,
             "followers": 20,

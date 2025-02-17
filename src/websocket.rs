@@ -33,7 +33,7 @@ pub struct TradingViewPacket {
 }
 
 fn generate_session_id(type_: &str) -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let characters: Vec<char> = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
         .chars()
         .collect();
@@ -41,7 +41,7 @@ fn generate_session_id(type_: &str) -> String {
     let mut session_id = String::new();
 
     for _ in 0..12 {
-        let random_index = rng.gen_range(0..characters.len());
+        let random_index = rng.random_range(0..characters.len());
         session_id.push(characters[random_index]);
     }
 

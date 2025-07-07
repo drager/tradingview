@@ -8,7 +8,7 @@ repository = "https://github.com/drager/tradingview.git"
 license = "Apache-2.0"
 
 [dependencies]
-reqwest = { version = "0.12.12", features = ["json", "multipart", "cookies"] }
+reqwest = { version = "0.12.22", features = ["json", "multipart", "cookies"] }
 anyhow = "1.0.95"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

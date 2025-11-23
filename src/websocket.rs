@@ -14,6 +14,7 @@ use serde_json::Value;
 use std::str;
 use std::sync::Arc;
 use tokio::net::TcpStream;
+use tokio::time::{sleep, Duration};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
@@ -137,7 +138,7 @@ impl WebSocketClient {
             None => Err(anyhow::anyhow!("User not logged in")),
             Some(user) => {
                 let mut request = Url::parse(&format!(
-                    "wss://{}.tradingview.com/socket.io/websocket?&type=chart",
+                    "wss://{}.tradingview.com/socket.io/websocket?type=chart",
                     // TODO: More types? Premium?
                     if user.is_pro { "prodata" } else { "data" }
                 ))?
@@ -146,7 +147,18 @@ impl WebSocketClient {
                 let headers = request.headers_mut();
                 headers.insert(
                     "Origin",
-                    HeaderValue::from_static("https://s.tradingview.com"),
+                    HeaderValue::from_static("https://www.tradingview.com"),
+                );
+                headers.insert("Pragma", HeaderValue::from_static("no-cache"));
+                headers.insert(
+                    "User-Agent",
+                    HeaderValue::from_static(
+                        "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0",
+                    ),
+                );
+                headers.insert(
+                    "Connection",
+                    HeaderValue::from_static("keep-alive, Upgrade"),
                 );
 
                 let (ws_stream, _) = connect_async(request).await?;
@@ -208,6 +220,8 @@ impl WebSocketClient {
         currency: &Currency,
     ) -> anyhow::Result<Box<dyn Stream<Item = anyhow::Result<TradingViewPacket>> + Unpin + Send>>
     {
+        self.send_auth_message().await?;
+
         self.send(&format_ws_packet(&Either::Left(TradingViewPacket {
             packet_type: "chart_create_session".to_owned(),
             data: Some(vec![Value::String(self.session_id.clone())]),
@@ -219,28 +233,30 @@ impl WebSocketClient {
             serde_json::json!({ "symbol": ticker_symbol, "adjustment": "splits", "currency-id": currency, "session": "extended" })
         );
 
-        self.send(&format_ws_packet(&Either::Left(TradingViewPacket {
+        let resolve_package = &format_ws_packet(&Either::Left(TradingViewPacket {
             packet_type: "resolve_symbol".to_owned(),
             data: Some(vec![
                 Value::String(self.session_id.clone()),
-                Value::String(format!("ser_{}", 1)),
+                Value::String(format!("sds_sym_{}", 1)),
                 Value::String(symbol_key),
             ]),
-        })))
-        .await?;
+        }));
 
-        self.send(&format_ws_packet(&Either::Left(TradingViewPacket {
+        self.send(resolve_package).await?;
+
+        let create_series_package = &format_ws_packet(&Either::Left(TradingViewPacket {
             packet_type: "create_series".to_owned(),
             data: Some(vec![
                 Value::String(self.session_id.clone()),
                 Value::String("$prices".to_string()),
                 Value::String("s1".to_string()),
-                Value::String(format!("ser_{}", 1)),
+                Value::String(format!("sds_sym_{}", 1)),
                 Value::String(timeframe.to_string()),
                 Value::Number(range.into()),
             ]),
-        })))
-        .await?;
+        }));
+
+        self.send(create_series_package).await?;
 
         self.listen_to_incoming().await
     }
@@ -286,6 +302,8 @@ impl WebSocketClient {
         } = self;
 
         let write_stream = Arc::new(Mutex::new(write_stream));
+        let mut retry_attempts = 0;
+        let max_retries = 5;
 
         let data_stream = async_stream::stream! {
             loop {
@@ -295,12 +313,14 @@ impl WebSocketClient {
 
                         match Self::handle_ws_package(&text, &mut write_stream).await {
                             Ok(packets) => {
-                               for packet in packets {
+                                for packet in packets {
                                     log::debug!("Received packet: {:?}", packet);
                                     yield Ok(packet);
                                 }
+                                retry_attempts = 0;
                             },
                             Err(e) => {
+                                log::error!("Error handling WebSocket package: {}", e);
                                 yield Err(e);
                                 break;
                             }
@@ -317,9 +337,20 @@ impl WebSocketClient {
                     Some(Err(e)) => {
                         log::error!("Error reading WebSocket message: {}", e);
                         yield Err(anyhow!("Error reading WebSocket message"));
+                        break;
                     }
                     None => {
-                        log::warn!("WebSocket stream ended unexpectedly, attempting to reconnect...");
+                        if retry_attempts < max_retries {
+                            let backoff = 2u64.pow(retry_attempts);
+                            log::warn!("WebSocket stream ended unexpectedly, attempting to reconnect in {} seconds...", backoff);
+                            sleep(Duration::from_secs(backoff)).await;
+                            retry_attempts += 1;
+                            continue;
+                        } else {
+                            log::error!("Max retry attempts reached. Giving up on reconnecting.");
+                            yield Err(anyhow!("Max retry attempts reached. Giving up on reconnecting."));
+                            break;
+                        }
                     }
                 }
             }

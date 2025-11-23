@@ -910,6 +910,7 @@ impl TradingView {
                                 },
                             ))
                         } else {
+                            log::warn!("Invalid packet: {:?}", packet);
                             futures::future::ready(None)
                         }
                     }
@@ -978,25 +979,20 @@ impl TradingView {
                             .high(
                                 price_row
                                     .get(2)
-                                    .and_then(|open| open.as_f64())
+                                    .and_then(|high| high.as_f64())
                                     .unwrap_or(0.0),
                             )
-                            .low(
-                                price_row
-                                    .get(3)
-                                    .and_then(|open| open.as_f64())
-                                    .unwrap_or(0.0),
-                            )
+                            .low(price_row.get(3).and_then(|low| low.as_f64()).unwrap_or(0.0))
                             .close(
                                 price_row
                                     .get(4)
-                                    .and_then(|open| open.as_f64())
+                                    .and_then(|close| close.as_f64())
                                     .unwrap_or(0.0),
                             )
                             .volume(
                                 price_row
                                     .get(5)
-                                    .and_then(|open| open.as_f64())
+                                    .and_then(|volume| volume.as_f64())
                                     .unwrap_or(0.0),
                             )
                             .build()

@@ -17,7 +17,7 @@ tokio-tungstenite = { version = "0.24.0", features = ["url"] }
 chrono = { version = "0.4.42", features = ["serde"] }
 futures = "0.3.16"
 typed-builder = "0.23.0"
-thiserror = "2.0.12"
+thiserror = "2.0.17"
 regex = "1.12.2"
 either = { version = "1.15.0", features = ["serde"]}
 log = "0.4.27"

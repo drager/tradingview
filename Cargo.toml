@@ -9,7 +9,7 @@ license = "Apache-2.0"
 
 [dependencies]
 reqwest = { version = "0.12.28", features = ["json", "multipart", "cookies"] }
-anyhow = "1.0.100"
+anyhow = "1.0.101"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = [ "full" ] }

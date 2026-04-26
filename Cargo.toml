@@ -21,7 +21,7 @@ thiserror = "2"
 regex = "1"
 either = { version = "1", features = ["serde"]}
 log = "0.4"
-rand = "0.9"
+rand = "0.10"
 libreauth = "0.17"
 env_logger = "0.11"
 async-stream = "0.3"

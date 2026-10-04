@@ -45,15 +45,12 @@ async fn main() -> anyhow::Result<()> {
 
     while let Some(data) = stream.next().await {
         println!(
-            "{}",
-            format!(
-                "{} {} ({} | {}%) Volume: {}",
-                data.get_symbol(),
-                data.get_price(),
-                data.get_change(),
-                data.get_change_percent().unwrap_or_default(),
-                data.get_volume()
-            )
+            "{} {} ({} | {}%) Volume: {}",
+            data.get_symbol(),
+            data.get_price(),
+            data.get_change(),
+            data.get_change_percent().unwrap_or_default(),
+            data.get_volume()
         );
     }
 

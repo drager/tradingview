@@ -18,13 +18,107 @@ use std::collections::HashSet;
 use std::fmt;
 use std::str;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
+use tokio::time::sleep;
 use typed_builder::TypedBuilder;
-use websocket::WebSocketClient;
 
 mod websocket;
 
+/// Base delay between websocket reconnect attempts.
+const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+/// Maximum delay between websocket reconnect attempts.
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// A connection alive at least this long resets the reconnect backoff.
+const RECONNECT_STABLE_SECS: u64 = 60;
+
+/// Browser-like User-Agent used where TradingView inspects the client.
+///
+/// The HTML endpoints (e.g. the cookie login behind [`TradingView::get_user`])
+/// serve a stripped page without the embedded `auth_token` to requests
+/// without a realistic browser User-Agent, so default `reqwest` (which sends
+/// none) and API-style UAs will not authenticate.
+pub(crate) const DEFAULT_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0";
+
+/// Install the rustls ring crypto provider exactly once (no-op unless the
+/// `rustls` feature is enabled).
+///
+/// Without this, feature unification can enable both `ring` and `aws-lc-rs`
+/// on the shared rustls crate, and rustls then panics on the first TLS
+/// handshake ("no process-level CryptoProvider"). An explicit install
+/// resolves the ambiguity; callers that want a different provider can
+/// install their own before the first request (ours is a no-op then).
+#[cfg(feature = "rustls")]
+pub(crate) fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+#[cfg(not(feature = "rustls"))]
+pub(crate) fn ensure_crypto_provider() {}
+
+/// Extract the last price from a `qsd`/`qdm` packet.
+///
+/// Returns `None` for non-quote packets, error packets, and deltas without
+/// both `lp` (last price) and `ch` (change).
+fn parse_last_price(packet: TradingViewPacket) -> Option<TradingViewLastPrice> {
+    if packet.packet_type != "qsd" && packet.packet_type != "qdm" {
+        return None;
+    }
+    let mut data = packet.data?;
+    let entry = data.pop()?;
+    let object = entry.as_object()?;
+    if object.get("s").and_then(|s| s.as_str()) != Some("ok") {
+        return None;
+    }
+    let symbol = object
+        .get("n")
+        .and_then(|n| n.as_str())
+        .map(symbol_from_key)?;
+    let v = object.get("v").and_then(|v| v.as_object())?;
+    let price = v.get("lp").and_then(|p| p.as_f64())?;
+    let change = v.get("ch").and_then(|c| c.as_f64())?;
+    let change_percent = v.get("chp").and_then(|c| c.as_f64());
+    // `lp_time` is epoch seconds; fall back to the current time in the same
+    // unit (older versions mixed milliseconds in here).
+    let timestamp = v
+        .get("lp_time")
+        .and_then(|t| t.as_u64())
+        .unwrap_or_else(|| Utc::now().timestamp().unsigned_abs());
+    let volume = v.get("volume").and_then(|v| v.as_f64()).unwrap_or_default();
+
+    Some(TradingViewLastPrice {
+        symbol,
+        price,
+        change,
+        change_percent,
+        timestamp,
+        volume,
+    })
+}
+
+/// Resolve the quote subject of a `qsd`/`qdm` entry to `EXCH:SYM`.
+///
+/// TV sends either a plain `"CME_MINI:ES1!"` or a JSON document of the form
+/// `"={\"currency-id\":\"USD\",\"symbol\":\"CME_MINI:ES1!\"}"`.
+fn symbol_from_key(raw: &str) -> String {
+    let body = raw.strip_prefix('=').unwrap_or(raw);
+    if body.starts_with('{') {
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            if let Some(symbol) = value.get("symbol").and_then(|s| s.as_str()) {
+                return symbol.to_string();
+            }
+        }
+    }
+    body.to_string()
+}
+
 pub use either::Either;
+pub use websocket::{TradingViewPacket, WebSocketClient};
 
 #[derive(Debug, Serialize, Deserialize, TypedBuilder)]
 pub struct Source {
@@ -183,7 +277,7 @@ pub struct Instrument {
     pub source: Source,
 }
 
-#[derive(Debug, Serialize, Deserialize, TypedBuilder)]
+#[derive(Debug, Clone, Serialize, Deserialize, TypedBuilder)]
 pub struct TickerSymbol {
     symbol: String,
     currency: Currency,
@@ -225,7 +319,7 @@ impl Ohlc {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Currency {
     Eur,
@@ -325,6 +419,19 @@ pub struct User {
 }
 
 impl User {
+    /// Build a session user from a raw `auth_token` (session reuse).
+    ///
+    /// Lets callers skip the interactive username/password login when they
+    /// already hold a valid token, e.g. captured from a logged-in browser
+    /// session. All other fields are left at defaults, which routes the
+    /// socket to the standard `data.tradingview.com` host.
+    pub fn from_auth_token(auth_token: impl Into<String>) -> Self {
+        Self {
+            auth_token: auth_token.into(),
+            ..Default::default()
+        }
+    }
+
     pub fn get_id(&self) -> u32 {
         self.id
     }
@@ -430,16 +537,19 @@ pub enum TradingViewError {
 
     #[error(transparent)]
     ChronoParseError(#[from] chrono::ParseError),
+
+    #[error("Raw error from Tradingview: {0}")]
+    RawStringError(String),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TradingViewLastPrice {
-    symbol: String,
-    price: f64,
-    timestamp: u64,
-    change: f64,
-    change_percent: Option<f64>,
-    volume: f64,
+    pub symbol: String,
+    pub price: f64,
+    pub timestamp: u64,
+    pub change: f64,
+    pub change_percent: Option<f64>,
+    pub volume: f64,
 }
 
 impl TradingViewLastPrice {
@@ -490,6 +600,7 @@ impl TradingView {
     const SERVER_URL: &'static str = "https://www.tradingview.com";
 
     pub fn new(client_options: ClientOptions) -> Self {
+        ensure_crypto_provider();
         TradingView {
             client_options,
             user: Arc::new(Mutex::new(None)),
@@ -547,17 +658,17 @@ impl TradingView {
             _ => {
                 let cookies = res.cookies().collect::<Vec<_>>();
 
-                let session_cookie = cookies
+                let session = cookies
                     .iter()
                     .find(|c| c.name() == "sessionid")
-                    .ok_or(TradingViewError::InvalidCredentials)?;
-                let session = session_cookie.value().to_string();
+                    .map(|cookie| cookie.value().to_string())
+                    .unwrap_or_default();
 
-                let sign_cookie = cookies
+                let signature = cookies
                     .iter()
                     .find(|c| c.name() == "sessionid_sign")
-                    .ok_or(TradingViewError::InvalidCredentials)?;
-                let signature = sign_cookie.value().to_string();
+                    .map(|cookie| cookie.value().to_string())
+                    .unwrap_or_default();
 
                 let user_response: Value = res.json().await?;
 
@@ -584,14 +695,27 @@ impl TradingView {
                         return self.two_factor(&code, &user).await;
                     }
 
-                    if let Some(code) = user_response.get("code") {
-                        if code.as_str() == Some("recaptcha_required") {
+                    let error_code = user_response.get("code").and_then(|c| c.as_str());
+
+                    if let Some(code) = error_code {
+                        if code == "recaptcha_required" {
                             // TODO: Handle it in this library instead of just returning an error.
                             return Err(TradingViewError::RecapchaRequired.into());
                         }
+
+                        if code == "rate_limit" {
+                            return Err(TradingViewError::TooManyRequests.into());
+                        }
                     }
 
-                    return Err(TradingViewError::InvalidCredentials.into());
+                    return Err(TradingViewError::RawStringError(format!(
+                        "{}{}",
+                        error,
+                        error_code
+                            .map(|c| format!("Error code: {}", c))
+                            .unwrap_or_default()
+                    ))
+                    .into());
                 }
 
                 self.get_user_from_cookie(&user_response, &session, &signature)
@@ -738,6 +862,12 @@ impl TradingView {
         self.user.lock().await.replace(user);
     }
 
+    /// Get a handle to the shared user cell, for APIs that take
+    /// `Arc<Mutex<Option<User>>>` directly (e.g. [`WebSocketClient::new`]).
+    pub fn user_handle(&self) -> Arc<Mutex<Option<User>>> {
+        Arc::clone(&self.user)
+    }
+
     pub async fn get_user(&self, session: &str, signature: &str) -> anyhow::Result<User> {
         let url = Url::parse(
             self.client_options
@@ -754,6 +884,15 @@ impl TradingView {
 
         let mut headers = HeaderMap::new();
         headers.insert("Cookie", cookies[0].clone());
+        headers.insert(
+            "User-Agent",
+            HeaderValue::from_str(
+                self.client_options
+                    .user_agent
+                    .as_deref()
+                    .unwrap_or(DEFAULT_USER_AGENT),
+            )?,
+        );
 
         let response = client.get(url).headers(headers).send().await?;
 
@@ -825,7 +964,7 @@ impl TradingView {
                 .expect("date_joined not found when parsing user from token")
                 .to_string();
 
-            Ok(User {
+            let user = User {
                 id,
                 username,
                 session: Some(session.to_string()),
@@ -839,7 +978,15 @@ impl TradingView {
                 auth_token,
                 date_joined: deserialize_datetime_string(&date_joined)?,
                 active_broker: None,
-            })
+            };
+
+            // Persist the resolved user on this instance, mirroring
+            // `get_user_from_cookie`, so subsequent socket/API calls
+            // (`WebSocketClient::new`, `subscribe_to_symbols`, ...) see the
+            // session instead of "User not logged in".
+            self.user.lock().await.replace(user.clone());
+
+            Ok(user)
         } else {
             Err(TradingViewError::AuthenticationFailed.into())
         }
@@ -849,78 +996,61 @@ impl TradingView {
         &self,
         ticker_symbols: &[TickerSymbol],
     ) -> anyhow::Result<Box<dyn Stream<Item = TradingViewLastPrice> + Unpin + Send>> {
-        let websocket = WebSocketClient::new(self.user.clone()).await?;
+        if self.user.lock().await.is_none() {
+            return Err(TradingViewError::AuthenticationFailed.into());
+        }
+        let ticker_symbols = ticker_symbols.to_vec();
+        let user = Arc::clone(&self.user);
 
-        Ok(Box::new(
-            websocket.subscribe(ticker_symbols).await?.filter_map(
-                move |tv_packet| match tv_packet {
-                    Ok(packet) => {
-                        if packet.packet_type == "qsd"
-                            && packet.data.is_some()
-                            && packet.data.as_ref().unwrap()[1]
-                                .as_object()
-                                .and_then(|o| o.get("s"))
-                                .and_then(|s| s.as_str())
-                                .unwrap_or_default()
-                                == "ok"
-                        {
-                            futures::future::ready(packet.data.and_then(|mut d| d.pop()).and_then(
-                                |data| {
-                                    data.as_object().and_then(|data| {
-                                        let symbol = serde_json::from_str::<Value>(
-                                            data.get("n")
-                                                .and_then(|s| s.as_str())
-                                                .unwrap_or_default(),
-                                        )
-                                        .map(|s| {
-                                            s.get("symbol")
-                                                .and_then(|s| s.as_str())
-                                                .unwrap_or_default()
-                                                .to_string()
-                                        })
-                                        .ok();
-                                        let v = data.get("v").and_then(|v| v.as_object());
-                                        let price = v?.get("lp").and_then(|p| p.as_f64());
-                                        let change = v?.get("ch").and_then(|c| c.as_f64());
-                                        let change_percent = v?.get("chp").and_then(|c| c.as_f64());
-                                        let timestamp =
-                                            v?.get("lp_time").and_then(|t| t.as_u64()).unwrap_or(
-                                                chrono::Utc::now().timestamp_millis() as u64,
-                                            );
-
-                                        let volume = v?
-                                            .get("volume")
-                                            .and_then(|v| v.as_f64())
-                                            .unwrap_or_default();
-
-                                        match (symbol, price, change) {
-                                            (Some(symbol), Some(price), Some(change)) => {
-                                                Some(TradingViewLastPrice {
-                                                    symbol,
-                                                    price,
-                                                    change,
-                                                    change_percent,
-                                                    timestamp,
-                                                    volume,
-                                                })
-                                            }
-                                            _ => None,
-                                        }
-                                    })
-                                },
-                            ))
-                        } else {
-                            log::warn!("Invalid packet: {:?}", packet);
-                            futures::future::ready(None)
+        let stream = async_stream::stream! {
+            let mut backoff = RECONNECT_INITIAL_BACKOFF;
+            loop {
+                if user.lock().await.is_none() {
+                    log::error!("TradingView user logged out, stopping stream");
+                    break;
+                }
+                let connect_start = tokio::time::Instant::now();
+                let websocket = match WebSocketClient::new(Arc::clone(&user)).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        log::error!("TradingView connect failed: {e}; retrying in {backoff:?}");
+                        sleep(backoff).await;
+                        backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
+                        continue;
+                    }
+                };
+                let mut inner = match websocket.subscribe(&ticker_symbols).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        log::error!("TradingView subscribe failed: {e}; retrying in {backoff:?}");
+                        sleep(backoff).await;
+                        backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
+                        continue;
+                    }
+                };
+                while let Some(item) = inner.next().await {
+                    match item {
+                        Ok(packet) => {
+                            if let Some(price) = parse_last_price(packet) {
+                                yield price;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("TradingView websocket error: {e}");
+                            break;
                         }
                     }
-                    Err(e) => {
-                        log::error!("Error in websocket: {}", e);
-                        panic!("Error in websocket: {}", e)
-                    }
-                },
-            ),
-        ))
+                }
+                if connect_start.elapsed().as_secs() >= RECONNECT_STABLE_SECS {
+                    backoff = RECONNECT_INITIAL_BACKOFF;
+                }
+                log::warn!("TradingView websocket dropped; reconnecting in {backoff:?}");
+                sleep(backoff).await;
+                backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
+            }
+        };
+
+        Ok(Box::new(stream.boxed()))
     }
 
     pub async fn historical_data(
@@ -1107,6 +1237,78 @@ mod tests {
     use httpmock::MockServer;
     use serde_json::json;
 
+    #[test]
+    fn test_parse_last_price_plain_symbol() {
+        let packet = TradingViewPacket {
+            packet_type: "qsd".to_string(),
+            data: Some(vec![
+                json!("xs_session"),
+                json!({"n": "CME_MINI:ES1!", "s": "ok",
+                       "v": {"lp": 5000.25, "ch": 1.5, "chp": 0.03,
+                             "lp_time": 1782981440, "volume": 123.0}}),
+            ]),
+        };
+        let price = parse_last_price(packet).expect("should parse");
+        assert_eq!(price.symbol, "CME_MINI:ES1!");
+        assert_eq!(price.price, 5000.25);
+        assert_eq!(price.change, 1.5);
+        assert_eq!(price.change_percent, Some(0.03));
+        assert_eq!(price.timestamp, 1782981440);
+        assert_eq!(price.volume, 123.0);
+    }
+
+    #[test]
+    fn test_parse_last_price_json_symbol_key() {
+        let packet = TradingViewPacket {
+            packet_type: "qdm".to_string(),
+            data: Some(vec![
+                json!("xs_session"),
+                json!({"n": "={\"currency-id\":\"USD\",\"symbol\":\"COINBASE:BTCUSD\"}",
+                       "s": "ok", "v": {"lp": 63012.5, "ch": -12.25}}),
+            ]),
+        };
+        let price = parse_last_price(packet).expect("should parse");
+        assert_eq!(price.symbol, "COINBASE:BTCUSD");
+        assert_eq!(price.volume, 0.0);
+    }
+
+    #[test]
+    fn test_parse_last_price_skips_non_quotes() {
+        let completed = TradingViewPacket {
+            packet_type: "quote_completed".to_string(),
+            data: Some(vec![json!("xs_session"), json!("CME_MINI:ES1!")]),
+        };
+        assert!(parse_last_price(completed).is_none());
+
+        let no_change = TradingViewPacket {
+            packet_type: "qsd".to_string(),
+            data: Some(vec![
+                json!("xs_session"),
+                json!({"n": "CME_MINI:ES1!", "s": "ok", "v": {"lp": 5000.25}}),
+            ]),
+        };
+        assert!(parse_last_price(no_change).is_none());
+
+        let errored = TradingViewPacket {
+            packet_type: "qsd".to_string(),
+            data: Some(vec![
+                json!("xs_session"),
+                json!({"n": "CME_MINI:ES1!", "s": "error", "v": {"lp": 5000.25, "ch": 1.0}}),
+            ]),
+        };
+        assert!(parse_last_price(errored).is_none());
+    }
+
+    #[test]
+    fn test_symbol_from_key_variants() {
+        assert_eq!(symbol_from_key("SP:SPX"), "SP:SPX");
+        assert_eq!(
+            symbol_from_key("={\"currency-id\":\"SEK\",\"symbol\":\"OMXSTO:OMXS30\"}"),
+            "OMXSTO:OMXS30"
+        );
+        assert_eq!(symbol_from_key("={garbage"), "{garbage");
+    }
+
     #[tokio::test]
     async fn test_login_user() {
         let server = MockServer::start();
@@ -1207,7 +1409,11 @@ mod tests {
         .login("username", "password", true, None)
         .await;
 
-        assert!(result.is_err());
+        // Missing cookies are tolerated: the user parses, session and
+        // signature default to empty strings (socket auth uses auth_token).
+        let user = result.expect("login should succeed without cookies");
+        assert_eq!(user.get_session(), Some(""));
+        assert_eq!(user.get_signature(), Some(""));
     }
 
     #[test]

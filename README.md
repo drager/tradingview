@@ -11,6 +11,21 @@ Run the examples with the following commands:
 cargo run --features native-tls --example fetch_historical_data NDQ 20425 USD
 cargo run --features native-tls --example fetch_instruments
 cargo run --features native-tls --example realtime
+
+# Or use rustls instead of OpenSSL (no native-tls dependency - right choice
+# for static/musl builds):
+cargo run --features rustls --example realtime
+
+## TLS backends
+
+HTTPS and the WebSocket need a TLS backend, selected by feature:
+
+- `native-tls` - OpenSSL via the system (default on most glibc setups)
+- `rustls` - rustls with the ring provider and webpki roots, no OpenSSL, so
+  it works in static musl builds
+
+There is no TLS by default: build fails to reach `wss://`/`https://` unless
+one of the two features is enabled.
 ```
 
 ### Installation

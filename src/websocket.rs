@@ -14,7 +14,6 @@ use serde_json::Value;
 use std::str;
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::time::{sleep, Duration};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
@@ -132,6 +131,7 @@ pub struct WebSocketClient {
 impl WebSocketClient {
     /// Create a new instance of the WebSocketClient struct
     pub async fn new(user: Arc<Mutex<Option<User>>>) -> anyhow::Result<Self> {
+        crate::ensure_crypto_provider();
         let user = user.lock().await.clone();
 
         match user {
@@ -152,9 +152,7 @@ impl WebSocketClient {
                 headers.insert("Pragma", HeaderValue::from_static("no-cache"));
                 headers.insert(
                     "User-Agent",
-                    HeaderValue::from_static(
-                        "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0",
-                    ),
+                    HeaderValue::from_static(crate::DEFAULT_USER_AGENT),
                 );
                 headers.insert(
                     "Connection",
@@ -302,8 +300,6 @@ impl WebSocketClient {
         } = self;
 
         let write_stream = Arc::new(Mutex::new(write_stream));
-        let mut retry_attempts = 0;
-        let max_retries = 5;
 
         let data_stream = async_stream::stream! {
             loop {
@@ -317,7 +313,6 @@ impl WebSocketClient {
                                     log::debug!("Received packet: {:?}", packet);
                                     yield Ok(packet);
                                 }
-                                retry_attempts = 0;
                             },
                             Err(e) => {
                                 log::error!("Error handling WebSocket package: {}", e);
@@ -340,17 +335,9 @@ impl WebSocketClient {
                         break;
                     }
                     None => {
-                        if retry_attempts < max_retries {
-                            let backoff = 2u64.pow(retry_attempts);
-                            log::warn!("WebSocket stream ended unexpectedly, attempting to reconnect in {} seconds...", backoff);
-                            sleep(Duration::from_secs(backoff)).await;
-                            retry_attempts += 1;
-                            continue;
-                        } else {
-                            log::error!("Max retry attempts reached. Giving up on reconnecting.");
-                            yield Err(anyhow!("Max retry attempts reached. Giving up on reconnecting."));
-                            break;
-                        }
+                        log::warn!("WebSocket stream ended; caller must reconnect");
+                        yield Err(anyhow!("WebSocket stream ended"));
+                        break;
                     }
                 }
             }

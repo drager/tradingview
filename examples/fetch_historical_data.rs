@@ -48,11 +48,11 @@ async fn main() -> anyhow::Result<()> {
         );
         println!(
             "O: {} H: {} L: {} C: {} V: {}",
-            &ohlc.get_open(),
-            &ohlc.get_high(),
-            &ohlc.get_low(),
-            &ohlc.get_close(),
-            &ohlc.get_volume()
+            ohlc.get_open(),
+            ohlc.get_high(),
+            ohlc.get_low(),
+            ohlc.get_close(),
+            ohlc.get_volume()
         );
     }
 

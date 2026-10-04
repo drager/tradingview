@@ -6,7 +6,7 @@ use futures::stream::SplitStream;
 use futures::SinkExt;
 use futures::Stream;
 use futures::StreamExt;
-use rand::Rng;
+use rand::RngExt;
 use regex::Regex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -364,7 +364,7 @@ impl WebSocketClient {
     }
 
     async fn send(&mut self, msg: &str) -> anyhow::Result<()> {
-        let msg = Message::Text(msg.to_owned());
+        let msg = Message::Text(msg.into());
 
         log::debug!("Sending message to websocket: {}", msg);
 
@@ -380,7 +380,7 @@ impl WebSocketClient {
 
         log::debug!("Sending ping: {:?}", packet_string);
 
-        let msg = Message::Text(packet_string.to_owned());
+        let msg = Message::Text(packet_string.into());
 
         write_stream.send(msg).await.map_err(|e| e.into())
     }

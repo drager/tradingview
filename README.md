@@ -21,8 +21,10 @@ cargo run --features rustls --example realtime
 HTTPS and the WebSocket need a TLS backend, selected by feature:
 
 - `native-tls` - OpenSSL via the system (default on most glibc setups)
-- `rustls` - rustls with the ring provider and webpki roots, no OpenSSL, so
-  it works in static musl builds
+- `rustls` - rustls with the ring provider, no OpenSSL, so it works in static
+  musl builds. The WebSocket uses the bundled webpki roots; HTTPS uses the
+  platform verifier, so the system CA store (e.g. `ca-certificates`) must be
+  present at runtime
 
 There is no TLS by default: build fails to reach `wss://`/`https://` unless
 one of the two features is enabled.

@@ -1,8 +1,7 @@
 use std::{env, io};
 
 use chrono::DateTime;
-use futures::StreamExt;
-use tradingview::{ClientOptions, Currency, Timeframe, TradingView};
+use tradingview::{ClientOptions, Currency, TickerSymbol, Timeframe, TradingView};
 
 fn on_two_factor() -> String {
     println!("Enter two factor code: ");
@@ -27,33 +26,54 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
 
-    let ticker = env::args().nth(1).expect("No ticker provided");
-    let range: u32 = env::args().nth(2).expect("No range provided").parse()?;
-    let currency = Currency::from(env::args().nth(3).expect("No currency provided").as_str());
+    // Usage: fetch_historical_data <range> <currency> <ticker>...
+    let mut args = env::args().skip(1);
+    let range: u32 = args.next().expect("No range provided").parse()?;
+    let currency = Currency::from(args.next().expect("No currency provided").as_str());
+    let tickers: Vec<TickerSymbol> = args
+        .map(|symbol| {
+            TickerSymbol::builder()
+                .symbol(symbol)
+                .currency(currency.clone())
+                .build()
+        })
+        .collect();
+    assert!(!tickers.is_empty(), "No tickers provided");
 
-    let mut data = trading_view
-        .historical_data(&ticker, Timeframe::FiveMinutes, range, &currency)
-        .await?
-        .collect::<Vec<_>>()
-        .await;
+    // One call (and one websocket connection) for all tickers.
+    let data = trading_view
+        .historical_data(&tickers, Timeframe::FiveMinutes, range)
+        .await?;
 
-    for ohlc in data.iter_mut() {
-        let date = ohlc.get_timestamp();
+    for ticker in &tickers {
+        println!("== {}", ticker.get_symbol());
 
-        println!(
-            "date: {}",
-            DateTime::from_timestamp(date as i64, 0)
-                .ok_or_else(|| anyhow::anyhow!("Invalid date"))?
-                .format("%Y-%m-%d %H:%M:%S")
-        );
-        println!(
-            "O: {} H: {} L: {} C: {} V: {}",
-            ohlc.get_open(),
-            ohlc.get_high(),
-            ohlc.get_low(),
-            ohlc.get_close(),
-            ohlc.get_volume()
-        );
+        let ohlcs = match &data[ticker] {
+            Ok(ohlcs) => ohlcs,
+            Err(e) => {
+                println!("error: {e}");
+                continue;
+            }
+        };
+
+        for ohlc in ohlcs {
+            let date = ohlc.get_timestamp();
+
+            println!(
+                "date: {}",
+                DateTime::from_timestamp(date as i64, 0)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid date"))?
+                    .format("%Y-%m-%d %H:%M:%S")
+            );
+            println!(
+                "O: {} H: {} L: {} C: {} V: {}",
+                ohlc.get_open(),
+                ohlc.get_high(),
+                ohlc.get_low(),
+                ohlc.get_close(),
+                ohlc.get_volume()
+            );
+        }
     }
 
     Ok(())

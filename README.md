@@ -8,7 +8,7 @@ Check out the [examples](./examples) folder for a quick start on how to use the 
 Run the examples with the following commands:
 
 ```bash
-cargo run --features native-tls --example fetch_historical_data NDQ 20425 USD
+cargo run --features native-tls --example fetch_historical_data 300 USD NASDAQ:AAPL NASDAQ:MSFT
 cargo run --features native-tls --example fetch_instruments
 cargo run --features native-tls --example realtime
 

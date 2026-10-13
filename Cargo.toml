@@ -1,7 +1,7 @@
 [package]
 name = "tradingview"
 description = "Rust bindings for leveraging TradingView functionalities"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jesper Håkansson <jesper@jesperh.se>"]
 repository = "https://github.com/drager/tradingview.git"
@@ -47,7 +47,7 @@ httpmock = "0.8"
 default = []
 # TLS via OpenSSL (native-tls) for both HTTPS and the WebSocket.
 native-tls = ["tokio-tungstenite/native-tls", "reqwest/native-tls"]
-# TLS via rustls with the ring provider and webpki roots — no OpenSSL, so
+# TLS via rustls with the ring provider and webpki roots. No OpenSSL, so
 # this is the right choice for static (musl) builds.
 rustls = [
     "tokio-tungstenite/rustls-tls-webpki-roots",

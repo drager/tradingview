@@ -2,7 +2,6 @@ use chrono::serde::ts_seconds;
 use chrono::{DateTime, Utc};
 use chrono::{NaiveDate, TimeZone};
 use futures::lock::Mutex;
-use futures::stream;
 use futures::Stream;
 use futures::StreamExt;
 use libreauth::oath::TOTPBuilder;
@@ -14,7 +13,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde::{Deserializer, Serializer};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str;
 use std::sync::Arc;
@@ -47,7 +46,7 @@ pub(crate) const DEFAULT_USER_AGENT: &str =
 /// Without this, feature unification can enable both `ring` and `aws-lc-rs`
 /// on the shared rustls crate, and rustls then panics on the first TLS
 /// handshake ("no process-level CryptoProvider"). An explicit install
-/// resolves the ambiguity; callers that want a different provider can
+/// resolves the ambiguity. Callers that want a different provider can
 /// install their own before the first request (ours is a no-op then).
 #[cfg(feature = "rustls")]
 pub(crate) fn ensure_crypto_provider() {
@@ -83,7 +82,7 @@ fn parse_last_price(packet: TradingViewPacket) -> Option<TradingViewLastPrice> {
     let price = v.get("lp").and_then(|p| p.as_f64())?;
     let change = v.get("ch").and_then(|c| c.as_f64())?;
     let change_percent = v.get("chp").and_then(|c| c.as_f64());
-    // `lp_time` is epoch seconds; fall back to the current time in the same
+    // `lp_time` is epoch seconds. Fall back to the current time in the same
     // unit (older versions mixed milliseconds in here).
     let timestamp = v
         .get("lp_time")
@@ -99,6 +98,41 @@ fn parse_last_price(packet: TradingViewPacket) -> Option<TradingViewLastPrice> {
         timestamp,
         volume,
     })
+}
+
+/// Extract the bars from a `timescale_update` packet.
+///
+/// The payload is `[chart_session, {"$prices": {"s": [{"v": [time, open,
+/// high, low, close, volume]}, ...]}}]`. Anything else yields no bars.
+fn parse_timescale_update(packet: &TradingViewPacket) -> Vec<Ohlc> {
+    let rows = packet
+        .data
+        .as_ref()
+        .and_then(|data| data.get(1))
+        .and_then(|series| series.get("$prices"))
+        .and_then(|prices| prices.get("s"))
+        .and_then(|s| s.as_array());
+
+    let value = |row: &[Value], index: usize| {
+        row.get(index)
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0)
+    };
+
+    rows.into_iter()
+        .flatten()
+        .filter_map(|item| item.get("v").and_then(|v| v.as_array()))
+        .map(|row| {
+            Ohlc::builder()
+                .timestamp(value(row, 0) as u64)
+                .open(value(row, 1))
+                .high(value(row, 2))
+                .low(value(row, 3))
+                .close(value(row, 4))
+                .volume(value(row, 5))
+                .build()
+        })
+        .collect()
 }
 
 /// Resolve the quote subject of a `qsd`/`qdm` entry to `EXCH:SYM`.
@@ -277,10 +311,20 @@ pub struct Instrument {
     pub source: Source,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TypedBuilder)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TypedBuilder)]
 pub struct TickerSymbol {
     symbol: String,
     currency: Currency,
+}
+
+impl TickerSymbol {
+    pub fn get_symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    pub fn get_currency(&self) -> &Currency {
+        &self.currency
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TypedBuilder)]
@@ -319,7 +363,7 @@ impl Ohlc {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Currency {
     Eur,
@@ -531,6 +575,11 @@ pub enum TradingViewError {
 
     #[error("Internal server error.")]
     InternalServerError,
+
+    /// `historical_data` was asked for 0 bars. TradingView answers that
+    /// with a `critical_error` and drops the whole connection.
+    #[error("Range must be at least 1 bar.")]
+    InvalidRange,
 
     #[error("reqwest error")]
     ReqwestError(#[from] reqwest::Error),
@@ -1053,89 +1102,37 @@ impl TradingView {
         Ok(Box::new(stream.boxed()))
     }
 
+    /// Fetch the last `range` bars at `timeframe` for each symbol.
+    ///
+    /// All symbols share one WebSocket connection, so a batch costs a
+    /// single handshake (TradingView rate-limits new connections). For
+    /// different timeframes, group symbols by timeframe and call once per
+    /// group rather than once per symbol.
+    ///
+    /// The outer error covers connecting and authenticating. Each symbol
+    /// then gets its own result, so one bad ticker doesn't fail the batch.
+    /// Bars are sorted by timestamp, oldest first.
+    ///
+    /// `range` must be at least 1 ([`TradingViewError::InvalidRange`]).
+    /// This is checked before connecting. An empty `ticker_symbols` returns
+    /// an empty map without connecting.
     pub async fn historical_data(
         &self,
-        ticker_symbol: &str,
+        ticker_symbols: &[TickerSymbol],
         timeframe: Timeframe,
         range: u32,
-        currency: &Currency,
-    ) -> anyhow::Result<Box<dyn Stream<Item = Ohlc> + Unpin + Send + '_>> {
-        let websocket = WebSocketClient::new(self.user.clone()).await?;
-
-        let mut data = websocket
-            .historical_data(ticker_symbol, timeframe, range, currency)
-            .await?;
-
-        let mut items = vec![];
-
-        while let Some(Ok(tv_packet)) = data.next().await {
-            if tv_packet.packet_type == "timescale_update" && tv_packet.data.is_some() {
-                let prices = tv_packet
-                    .data
-                    .and_then(|d| d.get(1).cloned())
-                    .and_then(|data| {
-                        data.as_object()
-                            .cloned()
-                            .and_then(|prices| prices.get("$prices").cloned())
-                            .and_then(|data| data.get("s").map(|s| s.as_array().cloned()))
-                            .map(|items| {
-                                items
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .flat_map(|item| {
-                                        item.get("v").and_then(|v| v.as_array()).cloned()
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                    })
-                    .unwrap_or_default();
-
-                let prices = prices
-                    .iter()
-                    .map(|price_row| {
-                        Ohlc::builder()
-                            .timestamp(
-                                price_row
-                                    .first()
-                                    .and_then(|timestamp| timestamp.as_f64())
-                                    .unwrap_or(0.0) as u64,
-                            )
-                            .open(
-                                price_row
-                                    .get(1)
-                                    .and_then(|open| open.as_f64())
-                                    .unwrap_or(0.0),
-                            )
-                            .high(
-                                price_row
-                                    .get(2)
-                                    .and_then(|high| high.as_f64())
-                                    .unwrap_or(0.0),
-                            )
-                            .low(price_row.get(3).and_then(|low| low.as_f64()).unwrap_or(0.0))
-                            .close(
-                                price_row
-                                    .get(4)
-                                    .and_then(|close| close.as_f64())
-                                    .unwrap_or(0.0),
-                            )
-                            .volume(
-                                price_row
-                                    .get(5)
-                                    .and_then(|volume| volume.as_f64())
-                                    .unwrap_or(0.0),
-                            )
-                            .build()
-                    })
-                    .collect::<Vec<_>>();
-
-                items.extend(prices);
-
-                break;
-            }
+    ) -> anyhow::Result<HashMap<TickerSymbol, anyhow::Result<Vec<Ohlc>>>> {
+        if range == 0 {
+            return Err(TradingViewError::InvalidRange.into());
+        }
+        if ticker_symbols.is_empty() {
+            return Ok(HashMap::new());
         }
 
-        Ok(Box::new(Box::pin(stream::iter(items))))
+        WebSocketClient::new(self.user.clone())
+            .await?
+            .historical_data(ticker_symbols, timeframe, range)
+            .await
     }
 
     pub async fn fetch_instruments(
@@ -1236,6 +1233,74 @@ mod tests {
     use httpmock::Method::POST;
     use httpmock::MockServer;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn test_historical_data_rejects_zero_range() {
+        let tv = TradingView::new(ClientOptions::builder().build());
+        tv.provide_user(User::from_auth_token("token")).await;
+        let tickers = [TickerSymbol::builder()
+            .symbol("CME_MINI:NQ1!".to_string())
+            .currency(Currency::Usd)
+            .build()];
+
+        let err = tv
+            .historical_data(&tickers, Timeframe::FifteenMinutes, 0)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err.downcast_ref::<TradingViewError>(),
+            Some(TradingViewError::InvalidRange)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_historical_data_empty_symbols() {
+        // No user: proves we return before trying to connect.
+        let tv = TradingView::new(ClientOptions::builder().build());
+
+        let data = tv
+            .historical_data(&[], Timeframe::FifteenMinutes, 10)
+            .await
+            .unwrap();
+
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_parse_timescale_update() {
+        let packet = TradingViewPacket {
+            packet_type: "timescale_update".to_string(),
+            data: Some(vec![
+                json!("cs_session"),
+                json!({"$prices": {"node": "x", "s": [
+                    {"i": 0, "v": [1782981400.0, 1.0, 2.0, 0.5, 1.5, 100.0]},
+                    {"i": 1, "v": [1782981700.0, 1.5, 2.5, 1.0, 2.0, 200.0]},
+                ]}}),
+            ]),
+        };
+
+        let bars = parse_timescale_update(&packet);
+
+        assert_eq!(bars.len(), 2);
+        assert_eq!(bars[0].get_timestamp(), 1782981400);
+        assert_eq!(bars[0].get_open(), 1.0);
+        assert_eq!(bars[0].get_high(), 2.0);
+        assert_eq!(bars[0].get_low(), 0.5);
+        assert_eq!(bars[0].get_close(), 1.5);
+        assert_eq!(bars[0].get_volume(), 100.0);
+        assert_eq!(bars[1].get_timestamp(), 1782981700);
+    }
+
+    #[test]
+    fn test_parse_timescale_update_without_prices() {
+        let packet = TradingViewPacket {
+            packet_type: "timescale_update".to_string(),
+            data: Some(vec![json!("cs_session"), json!({"index": 1})]),
+        };
+
+        assert!(parse_timescale_update(&packet).is_empty());
+    }
 
     #[test]
     fn test_parse_last_price_plain_symbol() {

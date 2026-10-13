@@ -11,17 +11,35 @@ use regex::Regex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::time::{sleep, timeout};
+use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::handshake::client::Request;
+use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::TickerSymbol;
 use crate::Timeframe;
-use crate::{Currency, User};
+use crate::{parse_timescale_update, Ohlc, TradingViewError, User};
+
+/// Handshake attempts (including the first) before giving up on HTTP 429.
+const CONNECT_MAX_ATTEMPTS: u32 = 5;
+/// First delay after a 429 handshake, doubled on each further attempt.
+const CONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+/// Upper bound for a server-provided `Retry-After`.
+const CONNECT_MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// Chart sessions kept open at once on one socket by `historical_data`.
+const MAX_CONCURRENT_CHART_SESSIONS: usize = 10;
+/// Fail outstanding series if the socket stays silent this long.
+const HISTORICAL_DATA_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TradingViewPacket {
@@ -122,8 +140,8 @@ pub fn format_ws_packet(packet: &Either<TradingViewPacket, &str>) -> String {
 }
 
 pub struct WebSocketClient {
-    read_stream: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    write_stream: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    read_stream: SplitStream<WsStream>,
+    write_stream: SplitSink<WsStream, Message>,
     session_id: String,
     user: Arc<Mutex<Option<User>>>,
 }
@@ -137,29 +155,7 @@ impl WebSocketClient {
         match user {
             None => Err(anyhow::anyhow!("User not logged in")),
             Some(user) => {
-                let mut request = Url::parse(&format!(
-                    "wss://{}.tradingview.com/socket.io/websocket?type=chart",
-                    // TODO: More types? Premium?
-                    if user.is_pro { "prodata" } else { "data" }
-                ))?
-                .into_client_request()?;
-
-                let headers = request.headers_mut();
-                headers.insert(
-                    "Origin",
-                    HeaderValue::from_static("https://www.tradingview.com"),
-                );
-                headers.insert("Pragma", HeaderValue::from_static("no-cache"));
-                headers.insert(
-                    "User-Agent",
-                    HeaderValue::from_static(crate::DEFAULT_USER_AGENT),
-                );
-                headers.insert(
-                    "Connection",
-                    HeaderValue::from_static("keep-alive, Upgrade"),
-                );
-
-                let (ws_stream, _) = connect_async(request).await?;
+                let ws_stream = Self::connect(&user).await?;
 
                 let (write_stream, read_stream) = ws_stream.split();
 
@@ -171,6 +167,64 @@ impl WebSocketClient {
                     session_id,
                     user: Arc::new(Mutex::new(Some(user))),
                 })
+            }
+        }
+    }
+
+    fn build_request(user: &User) -> anyhow::Result<Request> {
+        let mut request = Url::parse(&format!(
+            "wss://{}.tradingview.com/socket.io/websocket?type=chart",
+            // TODO: More types? Premium?
+            if user.is_pro { "prodata" } else { "data" }
+        ))?
+        .into_client_request()?;
+
+        let headers = request.headers_mut();
+        headers.insert(
+            "Origin",
+            HeaderValue::from_static("https://www.tradingview.com"),
+        );
+        headers.insert("Pragma", HeaderValue::from_static("no-cache"));
+        headers.insert(
+            "User-Agent",
+            HeaderValue::from_static(crate::DEFAULT_USER_AGENT),
+        );
+        headers.insert(
+            "Connection",
+            HeaderValue::from_static("keep-alive, Upgrade"),
+        );
+
+        Ok(request)
+    }
+
+    /// Open the socket, backing off and retrying when TradingView rejects
+    /// the handshake with 429 (it rate-limits new connections per IP).
+    async fn connect(user: &User) -> anyhow::Result<WsStream> {
+        let mut backoff = CONNECT_INITIAL_BACKOFF;
+        let mut attempt = 1;
+        loop {
+            match connect_async(Self::build_request(user)?).await {
+                Ok((ws_stream, _)) => return Ok(ws_stream),
+                Err(tungstenite::Error::Http(response))
+                    if response.status() == StatusCode::TOO_MANY_REQUESTS
+                        && attempt < CONNECT_MAX_ATTEMPTS =>
+                {
+                    let delay = response
+                        .headers()
+                        .get("Retry-After")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .map(|secs| Duration::from_secs(secs).min(CONNECT_MAX_RETRY_AFTER))
+                        .unwrap_or(backoff);
+                    log::warn!(
+                        "TradingView websocket handshake rate limited (429); retrying in {delay:?} \
+                         (attempt {attempt}/{CONNECT_MAX_ATTEMPTS})"
+                    );
+                    sleep(delay).await;
+                    backoff *= 2;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -210,53 +264,205 @@ impl WebSocketClient {
         self.listen_to_incoming().await
     }
 
+    /// Fetch the last `range` bars at `timeframe` for every symbol over this
+    /// one socket, one chart session per symbol, then close the socket.
+    ///
+    /// The outer error covers failures before any series is requested
+    /// (e.g. auth). Afterwards each symbol gets its own result, so a bad
+    /// ticker or a dropped connection doesn't discard what already arrived.
     pub async fn historical_data(
         mut self,
-        ticker_symbol: &str,
+        ticker_symbols: &[TickerSymbol],
         timeframe: Timeframe,
         range: u32,
-        currency: &Currency,
-    ) -> anyhow::Result<Box<dyn Stream<Item = anyhow::Result<TradingViewPacket>> + Unpin + Send>>
-    {
+    ) -> anyhow::Result<HashMap<TickerSymbol, anyhow::Result<Vec<Ohlc>>>> {
+        // A 0-bar series is a `critical_error` that kills every session on
+        // the socket, so refuse it before sending anything.
+        if range == 0 {
+            return Err(TradingViewError::InvalidRange.into());
+        }
+
         self.send_auth_message().await?;
 
+        let timeframe = timeframe.to_string();
+        let mut seen = HashSet::new();
+        let mut queue: VecDeque<TickerSymbol> = ticker_symbols
+            .iter()
+            .filter(|symbol| seen.insert((*symbol).clone()))
+            .cloned()
+            .collect();
+        // Chart session id -> symbol and the bars received so far.
+        let mut in_flight: HashMap<String, (TickerSymbol, Vec<Ohlc>)> = HashMap::new();
+        let mut results = HashMap::new();
+
+        let failure = loop {
+            let mut send_failure = None;
+            while in_flight.len() < MAX_CONCURRENT_CHART_SESSIONS {
+                let Some(symbol) = queue.pop_front() else {
+                    break;
+                };
+                let chart_session = generate_session_id("cs");
+                if let Err(e) = self
+                    .start_series(&chart_session, &symbol, &timeframe, range)
+                    .await
+                {
+                    queue.push_front(symbol);
+                    send_failure = Some(format!("Failed to request series: {e}"));
+                    break;
+                }
+                in_flight.insert(chart_session, (symbol, Vec::new()));
+            }
+            if send_failure.is_some() {
+                break send_failure;
+            }
+            if in_flight.is_empty() {
+                break None;
+            }
+
+            let text = match timeout(HISTORICAL_DATA_IDLE_TIMEOUT, self.read_stream.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => text,
+                Ok(Some(Ok(Message::Close(reason)))) => {
+                    break Some(format!("WebSocket closed by server: {reason:?}"));
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(e))) => break Some(format!("Error reading WebSocket message: {e}")),
+                Ok(None) => break Some("WebSocket stream ended".to_owned()),
+                Err(_) => {
+                    break Some(format!(
+                        "Timed out after {HISTORICAL_DATA_IDLE_TIMEOUT:?} waiting for historical data"
+                    ));
+                }
+            };
+
+            let packets = match parse_ws_packet(&text) {
+                Ok(packets) => packets,
+                Err(e) => break Some(format!("Failed to parse WebSocket message: {e}")),
+            };
+
+            let mut fatal = None;
+            for packet in packets {
+                let packet = match packet {
+                    Either::Left(packet) => packet,
+                    Either::Right(ping_number) => {
+                        if let Err(e) = Self::ping(ping_number, &mut self.write_stream).await {
+                            fatal = Some(format!("Failed to answer ping: {e}"));
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                if packet.packet_type == "protocol_error" || packet.packet_type == "critical_error"
+                {
+                    fatal = Some(format!("Critical error: {:?}", packet.data));
+                    break;
+                }
+
+                let Some(chart_session) = packet
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.first())
+                    .and_then(|session| session.as_str())
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+
+                match packet.packet_type.as_str() {
+                    "timescale_update" => {
+                        if let Some((_, bars)) = in_flight.get_mut(&chart_session) {
+                            bars.extend(parse_timescale_update(&packet));
+                        }
+                    }
+                    "series_completed" => {
+                        if let Some((symbol, mut bars)) = in_flight.remove(&chart_session) {
+                            bars.sort_by_key(|bar| bar.get_timestamp());
+                            bars.dedup_by_key(|bar| bar.get_timestamp());
+                            results.insert(symbol, Ok(bars));
+                            let _ = self.delete_chart_session(&chart_session).await;
+                        }
+                    }
+                    "symbol_error" | "series_error" => {
+                        if let Some((symbol, _)) = in_flight.remove(&chart_session) {
+                            log::warn!("Historical data for {symbol:?} failed: {packet:?}");
+                            results.insert(
+                                symbol,
+                                Err(anyhow!("{}: {:?}", packet.packet_type, packet.data)),
+                            );
+                            let _ = self.delete_chart_session(&chart_session).await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if fatal.is_some() {
+                break fatal;
+            }
+        };
+
+        if let Some(reason) = failure {
+            log::error!("Historical data request aborted: {reason}");
+            for (symbol, _) in in_flight
+                .into_values()
+                .chain(queue.into_iter().map(|s| (s, vec![])))
+            {
+                results.insert(symbol, Err(anyhow!("{reason}")));
+            }
+        }
+
+        let _ = self.write_stream.close().await;
+
+        Ok(results)
+    }
+
+    async fn start_series(
+        &mut self,
+        chart_session: &str,
+        symbol: &TickerSymbol,
+        timeframe: &str,
+        range: u32,
+    ) -> anyhow::Result<()> {
         self.send(&format_ws_packet(&Either::Left(TradingViewPacket {
             packet_type: "chart_create_session".to_owned(),
-            data: Some(vec![Value::String(self.session_id.clone())]),
+            data: Some(vec![Value::String(chart_session.to_owned())]),
         })))
         .await?;
 
         let symbol_key = format!(
             "={}",
-            serde_json::json!({ "symbol": ticker_symbol, "adjustment": "splits", "currency-id": currency, "session": "extended" })
+            serde_json::json!({ "symbol": symbol.symbol, "adjustment": "splits", "currency-id": symbol.currency, "session": "extended" })
         );
 
-        let resolve_package = &format_ws_packet(&Either::Left(TradingViewPacket {
+        self.send(&format_ws_packet(&Either::Left(TradingViewPacket {
             packet_type: "resolve_symbol".to_owned(),
             data: Some(vec![
-                Value::String(self.session_id.clone()),
-                Value::String(format!("sds_sym_{}", 1)),
+                Value::String(chart_session.to_owned()),
+                Value::String("sds_sym_1".to_owned()),
                 Value::String(symbol_key),
             ]),
-        }));
+        })))
+        .await?;
 
-        self.send(resolve_package).await?;
-
-        let create_series_package = &format_ws_packet(&Either::Left(TradingViewPacket {
+        self.send(&format_ws_packet(&Either::Left(TradingViewPacket {
             packet_type: "create_series".to_owned(),
             data: Some(vec![
-                Value::String(self.session_id.clone()),
-                Value::String("$prices".to_string()),
-                Value::String("s1".to_string()),
-                Value::String(format!("sds_sym_{}", 1)),
-                Value::String(timeframe.to_string()),
+                Value::String(chart_session.to_owned()),
+                Value::String("$prices".to_owned()),
+                Value::String("s1".to_owned()),
+                Value::String("sds_sym_1".to_owned()),
+                Value::String(timeframe.to_owned()),
                 Value::Number(range.into()),
             ]),
-        }));
+        })))
+        .await
+    }
 
-        self.send(create_series_package).await?;
-
-        self.listen_to_incoming().await
+    async fn delete_chart_session(&mut self, chart_session: &str) -> anyhow::Result<()> {
+        self.send(&format_ws_packet(&Either::Left(TradingViewPacket {
+            packet_type: "chart_delete_session".to_owned(),
+            data: Some(vec![Value::String(chart_session.to_owned())]),
+        })))
+        .await
     }
 
     pub async fn fetch_instruments(
@@ -373,7 +579,7 @@ impl WebSocketClient {
 
     async fn ping(
         ping_number: i32,
-        write_stream: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+        write_stream: &mut SplitSink<WsStream, Message>,
     ) -> anyhow::Result<()> {
         let ping_message = format!("~h~{}", ping_number);
         let packet_string = format_ws_packet(&Either::Right(&ping_message));
@@ -387,7 +593,7 @@ impl WebSocketClient {
 
     async fn handle_ws_package(
         data: &str,
-        write_stream: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+        write_stream: &mut SplitSink<WsStream, Message>,
     ) -> anyhow::Result<Vec<TradingViewPacket>> {
         let packets = parse_ws_packet(data)?;
 

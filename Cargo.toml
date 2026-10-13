@@ -6,6 +6,8 @@ edition = "2021"
 authors = ["Jesper Håkansson <jesper@jesperh.se>"]
 repository = "https://github.com/drager/tradingview.git"
 license = "Apache-2.0"
+keywords = ["tradingview", "finance", "trading", "market-data", "websocket"]
+categories = ["api-bindings", "finance", "web-programming::websocket"]
 
 [dependencies]
 reqwest = { version = "0.13", default-features = false, features = [

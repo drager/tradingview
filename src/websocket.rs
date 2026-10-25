@@ -12,6 +12,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::Hash;
 use std::str;
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,6 +65,28 @@ fn generate_session_id(type_: &str) -> String {
     }
 
     format!("{}_{}", type_, session_id)
+}
+
+/// Drop repeated symbols by `key`, keeping the first occurrence of each.
+///
+/// TradingView answers a symbol added twice to one session with a
+/// `critical_error` that closes the socket, so a single duplicate would
+/// otherwise fail every symbol in the request (and loop forever in
+/// `subscribe_to_symbols`, which reconnects with the same list).
+pub(crate) fn dedupe_symbols<K: Eq + Hash>(
+    ticker_symbols: &[TickerSymbol],
+    key: impl Fn(&TickerSymbol) -> K,
+) -> Vec<TickerSymbol> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::with_capacity(ticker_symbols.len());
+    for symbol in ticker_symbols {
+        if seen.insert(key(symbol)) {
+            unique.push(symbol.clone());
+        } else {
+            log::warn!("Ignoring duplicate symbol in request: {symbol:?}");
+        }
+    }
+    unique
 }
 
 fn parse_ws_packet(data: &str) -> anyhow::Result<Vec<Either<TradingViewPacket, i32>>> {
@@ -245,7 +268,7 @@ impl WebSocketClient {
         })))
         .await?;
 
-        for ticker_symbol in ticker_symbols {
+        for ticker_symbol in &dedupe_symbols(ticker_symbols, TickerSymbol::clone) {
             let symbol_key = format!(
                 "={}",
                 serde_json::json!({ "symbol": ticker_symbol.symbol, "currency-id": ticker_symbol.currency })
@@ -285,12 +308,8 @@ impl WebSocketClient {
         self.send_auth_message().await?;
 
         let timeframe = timeframe.to_string();
-        let mut seen = HashSet::new();
-        let mut queue: VecDeque<TickerSymbol> = ticker_symbols
-            .iter()
-            .filter(|symbol| seen.insert((*symbol).clone()))
-            .cloned()
-            .collect();
+        let mut queue: VecDeque<TickerSymbol> =
+            dedupe_symbols(ticker_symbols, TickerSymbol::clone).into();
         // Chart session id -> symbol and the bars received so far.
         let mut in_flight: HashMap<String, (TickerSymbol, Vec<Ohlc>)> = HashMap::new();
         let mut results = HashMap::new();
@@ -480,8 +499,10 @@ impl WebSocketClient {
 
         let mut data = vec![Value::String(self.session_id.clone())];
 
-        for ticker in ticker_symbols {
-            data.push(Value::String(ticker.symbol.clone()));
+        // Only the plain symbol is sent here, so the same symbol in two
+        // currencies is still a duplicate.
+        for ticker in dedupe_symbols(ticker_symbols, |ticker| ticker.symbol.clone()) {
+            data.push(Value::String(ticker.symbol));
         }
 
         let tv_packet = TradingViewPacket {
@@ -649,6 +670,7 @@ impl WebSocketClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Currency;
 
     #[test]
     fn test_parse_ws_packet() {
@@ -679,6 +701,30 @@ mod tests {
                 parsed
             );
         }
+    }
+
+    #[test]
+    fn test_dedupe_symbols_keeps_first_occurrence_in_order() {
+        let symbol = |name: &str, currency: Currency| {
+            TickerSymbol::builder()
+                .symbol(name.to_string())
+                .currency(currency)
+                .build()
+        };
+        let nq = symbol("CME_MINI:NQ1!", Currency::Usd);
+        let adv = symbol("USI:ADV", Currency::Usd);
+        let nq_eur = symbol("CME_MINI:NQ1!", Currency::Eur);
+
+        let input = [nq.clone(), adv.clone(), nq.clone(), nq_eur.clone()];
+
+        assert_eq!(
+            dedupe_symbols(&input, TickerSymbol::clone),
+            vec![nq.clone(), adv.clone(), nq_eur]
+        );
+        assert_eq!(
+            dedupe_symbols(&input, |ticker| ticker.symbol.clone()),
+            vec![nq, adv]
+        );
     }
 
     #[test]

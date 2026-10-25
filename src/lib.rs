@@ -1048,7 +1048,8 @@ impl TradingView {
         if self.user.lock().await.is_none() {
             return Err(TradingViewError::AuthenticationFailed.into());
         }
-        let ticker_symbols = ticker_symbols.to_vec();
+        // Deduped once here so the warning isn't repeated on every reconnect.
+        let ticker_symbols = websocket::dedupe_symbols(ticker_symbols, TickerSymbol::clone);
         let user = Arc::clone(&self.user);
 
         let stream = async_stream::stream! {

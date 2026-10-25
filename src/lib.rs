@@ -74,10 +74,10 @@ fn parse_last_price(packet: TradingViewPacket) -> Option<TradingViewLastPrice> {
     if object.get("s").and_then(|s| s.as_str()) != Some("ok") {
         return None;
     }
-    let symbol = object
+    let (symbol, currency) = object
         .get("n")
         .and_then(|n| n.as_str())
-        .map(symbol_from_key)?;
+        .map(parse_symbol_key)?;
     let v = object.get("v").and_then(|v| v.as_object())?;
     let price = v.get("lp").and_then(|p| p.as_f64())?;
     let change = v.get("ch").and_then(|c| c.as_f64())?;
@@ -92,6 +92,7 @@ fn parse_last_price(packet: TradingViewPacket) -> Option<TradingViewLastPrice> {
 
     Some(TradingViewLastPrice {
         symbol,
+        currency,
         price,
         change,
         change_percent,
@@ -135,20 +136,26 @@ fn parse_timescale_update(packet: &TradingViewPacket) -> Vec<Ohlc> {
         .collect()
 }
 
-/// Resolve the quote subject of a `qsd`/`qdm` entry to `EXCH:SYM`.
+/// Resolve the quote subject of a `qsd`/`qdm` entry to `EXCH:SYM` and the
+/// currency it was subscribed in.
 ///
-/// TV sends either a plain `"CME_MINI:ES1!"` or a JSON document of the form
+/// TV sends either a plain `"CME_MINI:ES1!"` (no currency) or a JSON
+/// document of the form
 /// `"={\"currency-id\":\"USD\",\"symbol\":\"CME_MINI:ES1!\"}"`.
-fn symbol_from_key(raw: &str) -> String {
+/// The key is on every packet, so the currency needs no per-symbol state.
+fn parse_symbol_key(raw: &str) -> (String, Option<Currency>) {
     let body = raw.strip_prefix('=').unwrap_or(raw);
     if body.starts_with('{') {
         if let Ok(value) = serde_json::from_str::<Value>(body) {
             if let Some(symbol) = value.get("symbol").and_then(|s| s.as_str()) {
-                return symbol.to_string();
+                let currency = value
+                    .get("currency-id")
+                    .and_then(|c| Currency::deserialize(c).ok());
+                return (symbol.to_string(), currency);
             }
         }
     }
-    body.to_string()
+    (body.to_string(), None)
 }
 
 pub use either::Either;
@@ -594,6 +601,10 @@ pub enum TradingViewError {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TradingViewLastPrice {
     pub symbol: String,
+    /// The currency the symbol was subscribed in, which is also the
+    /// currency `price` is quoted in. Always set for
+    /// [`TradingView::subscribe_to_symbols`].
+    pub currency: Option<Currency>,
     pub price: f64,
     pub timestamp: u64,
     pub change: f64,
@@ -604,6 +615,10 @@ pub struct TradingViewLastPrice {
 impl TradingViewLastPrice {
     pub fn get_symbol(&self) -> &str {
         &self.symbol
+    }
+
+    pub fn get_currency(&self) -> Option<&Currency> {
+        self.currency.as_ref()
     }
 
     pub fn get_price(&self) -> f64 {
@@ -1316,6 +1331,7 @@ mod tests {
         };
         let price = parse_last_price(packet).expect("should parse");
         assert_eq!(price.symbol, "CME_MINI:ES1!");
+        assert_eq!(price.currency, None);
         assert_eq!(price.price, 5000.25);
         assert_eq!(price.change, 1.5);
         assert_eq!(price.change_percent, Some(0.03));
@@ -1335,6 +1351,7 @@ mod tests {
         };
         let price = parse_last_price(packet).expect("should parse");
         assert_eq!(price.symbol, "COINBASE:BTCUSD");
+        assert_eq!(price.currency, Some(Currency::Usd));
         assert_eq!(price.volume, 0.0);
     }
 
@@ -1366,13 +1383,21 @@ mod tests {
     }
 
     #[test]
-    fn test_symbol_from_key_variants() {
-        assert_eq!(symbol_from_key("SP:SPX"), "SP:SPX");
+    fn test_parse_symbol_key_variants() {
+        assert_eq!(parse_symbol_key("SP:SPX"), ("SP:SPX".to_string(), None));
         assert_eq!(
-            symbol_from_key("={\"currency-id\":\"SEK\",\"symbol\":\"OMXSTO:OMXS30\"}"),
-            "OMXSTO:OMXS30"
+            parse_symbol_key("={\"currency-id\":\"SEK\",\"symbol\":\"OMXSTO:OMXS30\"}"),
+            ("OMXSTO:OMXS30".to_string(), Some(Currency::Sek))
         );
-        assert_eq!(symbol_from_key("={garbage"), "{garbage");
+        // A currency the enum doesn't know is dropped, not a panic.
+        assert_eq!(
+            parse_symbol_key("={\"currency-id\":\"JPY\",\"symbol\":\"TSE:7203\"}"),
+            ("TSE:7203".to_string(), None)
+        );
+        assert_eq!(
+            parse_symbol_key("={garbage"),
+            ("{garbage".to_string(), None)
+        );
     }
 
     #[tokio::test]
